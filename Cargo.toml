@@ -1,0 +1,36 @@
+[workspace]
+members = [
+  "crates/wyrd-mind-core",
+  "crates/wyrd-mind-api",
+  "crates/wyrd-mind-cli",
+  "crates/wyrd-mind-mcp",
+  "app/src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Steven Forrester"]
+publish = false
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+axum = "0.7.9"
+chrono = { version = "0.4.42", features = ["serde"] }
+rusqlite = { version = "0.32.1", features = ["bundled", "chrono"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.6.6", features = ["cors"] }
+tauri = { version = "2.9.3", features = [] }
+tauri-build = "2.5.2"
+uuid = { version = "1.18.1", features = ["v4", "serde"] }
+
+wyrd-mind-api = { path = "crates/wyrd-mind-api" }
+wyrd-mind-core = { path = "crates/wyrd-mind-core" }
+wyrd-mind-mcp = { path = "crates/wyrd-mind-mcp" }

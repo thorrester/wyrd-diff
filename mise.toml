@@ -1,0 +1,65 @@
+[tools]
+node = "24.11.1"
+"npm:pnpm" = "10.23.0"
+rust = "1.91.1"
+python = "3.11.9"
+
+[settings]
+env_shell_expand = false
+
+[env]
+DATABASE_URL = "sqlite://./.data/wyrd-mind.db"
+WYRD_MIND_API_HOST = "127.0.0.1"
+WYRD_MIND_API_PORT = "8765"
+WYRD_MIND_TOKEN = "dev-local-token"
+
+[tasks.install]
+description = "Install frontend dependencies"
+run = "pnpm install --frozen-lockfile"
+
+[tasks.dev]
+description = "Run the Tauri desktop app; Tauri starts the local bridge"
+run = "pnpm --dir app tauri dev"
+
+[tasks."dev:api"]
+description = "Run the local API server"
+run = "cargo run --locked -p wyrd-mind-cli -- serve"
+
+[tasks."dev:mcp"]
+description = "Run the Wyrd Mind MCP server over stdio"
+run = "cargo run --locked -p wyrd-mind-mcp"
+
+[tasks."dev:ui"]
+description = "Run the SvelteKit development server"
+run = "pnpm --dir app dev --host 127.0.0.1 --port 5173"
+
+[tasks."tauri:dev"]
+description = "Run the Tauri desktop app in development; Tauri starts the local bridge"
+run = "pnpm --dir app tauri dev"
+
+[tasks.build]
+description = "Build the Tauri desktop app"
+run = "pnpm --dir app tauri build"
+
+[tasks.check]
+description = "Format check, lint, typecheck, Rust check, and tests"
+run = """
+pnpm --dir app format:check
+pnpm --dir app lint
+pnpm --dir app check
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+"""
+
+[tasks."db:migrate"]
+description = "Run SQLite migrations"
+run = "cargo run --locked -p wyrd-mind-cli -- db migrate"
+
+[tasks."db:reset"]
+description = "Reset local development SQLite database"
+run = "cargo run --locked -p wyrd-mind-cli -- db reset"
+
+[tasks."export:test"]
+description = "Validate trajectory JSONL export against fixture data"
+run = "cargo test --locked -p wyrd-mind-core export"

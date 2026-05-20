@@ -1,0 +1,17 @@
+[package]
+name = "wyrd-mind-tauri"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+tauri.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+wyrd-mind-api.workspace = true
+wyrd-mind-core.workspace = true

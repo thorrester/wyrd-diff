@@ -1,0 +1,12 @@
+{
+  "name": "wyrd-mind-workspace",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --dir app dev",
+    "check": "pnpm --dir app check",
+    "lint": "pnpm --dir app lint",
+    "format:check": "pnpm --dir app format:check",
+    "tauri": "pnpm --dir app tauri"
+  },
+  "packageManager": "pnpm@10.23.0"
+}

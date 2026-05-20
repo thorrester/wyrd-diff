@@ -1,0 +1,9 @@
+{
+  "hooks": [
+    {
+      "event": "Stop",
+      "command": "cargo run --manifest-path /path/to/wyrd-mind/Cargo.toml --locked -p wyrd-mind-cli -- hook agent-stop",
+      "timeout": 30000
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+/.data/
+/target/
+/app/.svelte-kit/
+/app/build/
+/app/dist/
+/app/node_modules/
+/app/src-tauri/target/
+*.log
+.DS_Store
