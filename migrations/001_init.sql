@@ -93,6 +93,38 @@ create table if not exists comments (
   updated_at text not null
 );
 
+create table if not exists review_threads (
+  id text primary key,
+  session_id text not null references review_sessions(id),
+  file_path text not null,
+  anchor_diff_line_id text references diff_lines(id),
+  old_line integer,
+  new_line integer,
+  range_start_old_line integer,
+  range_start_new_line integer,
+  range_end_old_line integer,
+  range_end_new_line integer,
+  selected_text text,
+  status text not null,
+  visibility text not null,
+  created_at text not null,
+  updated_at text not null
+);
+
+create table if not exists thread_messages (
+  id text primary key,
+  thread_id text not null references review_threads(id),
+  author_kind text not null,
+  author_name text,
+  message_type text not null,
+  body text not null,
+  status text not null,
+  visibility text not null,
+  fix_import_id text references fix_imports(id),
+  created_at text not null,
+  updated_at text not null
+);
+
 create table if not exists notes (
   id text primary key,
   repo_id text references repos(id),

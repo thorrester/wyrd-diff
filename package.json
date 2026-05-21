@@ -1,5 +1,5 @@
 {
-  "name": "wyrd-mind-workspace",
+  "name": "wyrd-diff-workspace",
   "private": true,
   "scripts": {
     "dev": "pnpm --dir app dev",

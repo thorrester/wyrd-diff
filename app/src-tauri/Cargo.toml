@@ -1,5 +1,5 @@
 [package]
-name = "wyrd-mind-tauri"
+name = "wyrd-diff-tauri"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,5 +13,5 @@ tauri-build.workspace = true
 tauri.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
-wyrd-mind-api.workspace = true
-wyrd-mind-core.workspace = true
+wyrd-diff-api.workspace = true
+wyrd-diff-core.workspace = true

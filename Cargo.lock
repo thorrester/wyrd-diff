@@ -4706,7 +4706,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wyrd-mind-api"
+name = "wyrd-diff-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -4715,22 +4715,22 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower-http",
- "wyrd-mind-core",
+ "wyrd-diff-core",
 ]
 
 [[package]]
-name = "wyrd-mind-cli"
+name = "wyrd-diff-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde_json",
  "tokio",
- "wyrd-mind-api",
- "wyrd-mind-core",
+ "wyrd-diff-api",
+ "wyrd-diff-core",
 ]
 
 [[package]]
-name = "wyrd-mind-core"
+name = "wyrd-diff-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -4745,25 +4745,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "wyrd-mind-mcp"
+name = "wyrd-diff-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
  "serde_json",
- "wyrd-mind-core",
+ "wyrd-diff-core",
 ]
 
 [[package]]
-name = "wyrd-mind-tauri"
+name = "wyrd-diff-tauri"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "tauri",
  "tauri-build",
  "tokio",
- "wyrd-mind-api",
- "wyrd-mind-core",
+ "wyrd-diff-api",
+ "wyrd-diff-core",
 ]
 
 [[package]]

@@ -1,9 +1,9 @@
 [workspace]
 members = [
-  "crates/wyrd-mind-core",
-  "crates/wyrd-mind-api",
-  "crates/wyrd-mind-cli",
-  "crates/wyrd-mind-mcp",
+  "crates/wyrd-diff-core",
+  "crates/wyrd-diff-api",
+  "crates/wyrd-diff-cli",
+  "crates/wyrd-diff-mcp",
   "app/src-tauri",
 ]
 resolver = "2"
@@ -31,6 +31,6 @@ tauri = { version = "2.9.3", features = [] }
 tauri-build = "2.5.2"
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 
-wyrd-mind-api = { path = "crates/wyrd-mind-api" }
-wyrd-mind-core = { path = "crates/wyrd-mind-core" }
-wyrd-mind-mcp = { path = "crates/wyrd-mind-mcp" }
+wyrd-diff-api = { path = "crates/wyrd-diff-api" }
+wyrd-diff-core = { path = "crates/wyrd-diff-core" }
+wyrd-diff-mcp = { path = "crates/wyrd-diff-mcp" }

@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cargo run --manifest-path /path/to/wyrd-mind/Cargo.toml --locked -p wyrd-mind-cli -- hook agent-stop",
+            "command": "cargo run --manifest-path /path/to/wyrd-diff/Cargo.toml --locked -p wyrd-diff-cli -- hook agent-stop",
             "timeout": 30
           }
         ]

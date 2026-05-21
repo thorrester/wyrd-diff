@@ -8,10 +8,10 @@ python = "3.11.9"
 env_shell_expand = false
 
 [env]
-DATABASE_URL = "sqlite://./.data/wyrd-mind.db"
-WYRD_MIND_API_HOST = "127.0.0.1"
-WYRD_MIND_API_PORT = "8765"
-WYRD_MIND_TOKEN = "dev-local-token"
+DATABASE_URL = "sqlite://./.data/wyrd-diff.db"
+WYRD_DIFF_API_HOST = "127.0.0.1"
+WYRD_DIFF_API_PORT = "8765"
+WYRD_DIFF_TOKEN = "dev-local-token"
 
 [tasks.install]
 description = "Install frontend dependencies"
@@ -23,11 +23,11 @@ run = "pnpm --dir app tauri dev"
 
 [tasks."dev:api"]
 description = "Run the local API server"
-run = "cargo run --locked -p wyrd-mind-cli -- serve"
+run = "cargo run --locked -p wyrd-diff-cli -- serve"
 
 [tasks."dev:mcp"]
-description = "Run the Wyrd Mind MCP server over stdio"
-run = "cargo run --locked -p wyrd-mind-mcp"
+description = "Run the Wyrd Diff MCP server over stdio"
+run = "cargo run --locked -p wyrd-diff-mcp"
 
 [tasks."dev:ui"]
 description = "Run the SvelteKit development server"
@@ -54,12 +54,12 @@ cargo test --locked --workspace
 
 [tasks."db:migrate"]
 description = "Run SQLite migrations"
-run = "cargo run --locked -p wyrd-mind-cli -- db migrate"
+run = "cargo run --locked -p wyrd-diff-cli -- db migrate"
 
 [tasks."db:reset"]
 description = "Reset local development SQLite database"
-run = "cargo run --locked -p wyrd-mind-cli -- db reset"
+run = "cargo run --locked -p wyrd-diff-cli -- db reset"
 
 [tasks."export:test"]
 description = "Validate trajectory JSONL export against fixture data"
-run = "cargo test --locked -p wyrd-mind-core export"
+run = "cargo test --locked -p wyrd-diff-core export"

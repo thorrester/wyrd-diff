@@ -1,5 +1,6 @@
 <script lang="ts">
   import { page } from '$app/stores';
+  import { tick } from 'svelte';
   import hljs from 'highlight.js/lib/core';
   import bash from 'highlight.js/lib/languages/bash';
   import css from 'highlight.js/lib/languages/css';
@@ -15,11 +16,11 @@
   import {
     api,
     apiBase,
-    token,
+    type FeedbackBatch,
     type ReviewFile,
-    type SourceContext,
     type ReviewSession,
-    type ReviewDiffLine
+    type ReviewDiffLine,
+    type ReviewThreadRecord
   } from '$lib/api';
 
   hljs.registerLanguage('bash', bash);
@@ -36,6 +37,7 @@
 
   let session: ReviewSession | null = null;
   let files: ReviewFile[] = [];
+  let threads: ReviewThreadRecord[] = [];
   let selected: ReviewDiffLine | null = null;
   let rangeStart: ReviewDiffLine | null = null;
   let rangeEnd: ReviewDiffLine | null = null;
@@ -43,46 +45,78 @@
   let selectedLineIds = new Set<string>();
   let selectionLabel = 'Select a diff line.';
   let selectingRange = false;
-  let commentBody = '';
-  let noteTitle = '';
-  let noteBody = '';
-  let decisionTitle = '';
-  let decisionContext = '';
-  let decision = '';
-  let rationale = '';
+  let composerAnchorLineId: string | null = null;
+  let composerOpen = false;
+  let threadType = 'comment';
+  let threadBody = '';
+  let threadVisibility = 'agent';
+  let replyBodies: Record<string, string> = {};
+  let activeThreadId: string | null = null;
   let message = '';
   let filter = '';
   let leftWidth = 300;
-  let rightWidth = 340;
   let filesHidden = false;
-  let sideHidden = false;
   const collapsed = new Set<string>();
   const skipped = new Set<string>();
   const revealedLarge = new Set<string>();
   const largeChangeThreshold = 500;
+  let lastBatch: FeedbackBatch | null = null;
+  let dispatching = false;
+  let batchPanelOpen = false;
 
   $: sessionId = $page.params.id;
-  $: gridColumns = `${filesHidden ? 0 : leftWidth}px 8px minmax(0, 1fr) 8px ${sideHidden ? 0 : rightWidth}px`;
+  $: gridColumns = `${filesHidden ? 0 : leftWidth}px 8px minmax(0, 1fr)`;
   $: visibleFiles = files.filter((item) =>
     item.file.path.toLowerCase().includes(filter.toLowerCase())
   );
   $: selectedLines = getSelectedRangeLines(files, selected, rangeStart, rangeEnd);
   $: selectedLineIds = new Set(selectedLines.map((line) => line.id));
   $: selectionLabel = formatRangeLabel(selectedLines);
+  $: threadsByLine = groupThreadsByLine(threads);
+  $: pendingThreadCount = threads.filter(isThreadPending).length;
+
+  function isThreadPending(thread: ReviewThreadRecord) {
+    if (thread.status !== 'open') return false;
+    const visible = thread.messages.filter((message) => message.visibility !== 'private');
+    if (visible.length === 0) return false;
+    const watermark = thread.last_delivered_message_id;
+    if (!watermark) {
+      return visible.some((message) => message.author_kind === 'human');
+    }
+    const index = visible.findIndex((message) => message.id === watermark);
+    if (index < 0) return visible.some((message) => message.author_kind === 'human');
+    return visible.slice(index + 1).some((message) => message.author_kind === 'human');
+  }
 
   async function load() {
     const sessionData = await api<{ review_session: ReviewSession }>(
       `/api/review-sessions/${sessionId}`
     );
     const diffData = await api<{ files: ReviewFile[] }>(`/api/review-sessions/${sessionId}/diff`);
+    const threadData = await api<{ threads: ReviewThreadRecord[] }>(
+      `/api/review-sessions/${sessionId}/threads`
+    );
     session = sessionData.review_session;
     files = diffData.files;
+    threads = threadData.threads;
   }
 
   function toggle(set: Set<string>, id: string) {
     if (set.has(id)) set.delete(id);
     else set.add(id);
     files = files;
+  }
+
+  function scrollDiffTo(fileId: string) {
+    requestAnimationFrame(() => {
+      const target = document.getElementById(fileId);
+      const container = document.querySelector<HTMLElement>('section.diff');
+      if (!target || !container) return;
+      const stickyOffset =
+        container.querySelector<HTMLElement>('.session-bar')?.offsetHeight ?? 0;
+      const top = target.offsetTop - container.offsetTop - stickyOffset - 4;
+      container.scrollTo({ top, behavior: 'smooth' });
+    });
   }
 
   function changeCount(item: ReviewFile) {
@@ -100,20 +134,6 @@
   function showLargeFile(id: string) {
     revealedLarge.add(id);
     files = files;
-  }
-
-  function selectedSourceContext(): SourceContext | null {
-    const lines = selectedLines;
-    if (lines.length === 0) return null;
-    const first = lines[0];
-    return {
-      file_path: first.file_path,
-      diff_line_id: first.id,
-      old_line: first.old_line,
-      new_line: first.new_line,
-      line_kind: first.line_kind,
-      content: lines.map((line) => line.content).join('\n')
-    };
   }
 
   function languageForPath(path: string) {
@@ -162,18 +182,13 @@
       .replaceAll("'", '&#39;');
   }
 
-  function startResize(pane: 'files' | 'side', event: MouseEvent) {
+  function startResize(event: MouseEvent) {
     event.preventDefault();
     const startX = event.clientX;
     const startLeft = leftWidth;
-    const startRight = rightWidth;
 
     function onMove(moveEvent: MouseEvent) {
-      if (pane === 'files') {
-        leftWidth = clamp(startLeft + moveEvent.clientX - startX, 180, 520);
-      } else {
-        rightWidth = clamp(startRight + startX - moveEvent.clientX, 260, 620);
-      }
+      leftWidth = clamp(startLeft + moveEvent.clientX - startX, 180, 520);
     }
 
     function onUp() {
@@ -235,18 +250,34 @@
 
     function onUp() {
       selectingRange = false;
+      composerAnchorLineId = rangeEnd?.id ?? line.id;
+      composerOpen = true;
       window.removeEventListener('mouseup', onUp);
       document.body.classList.remove('selecting-range');
+      void focusComposer();
     }
 
     document.body.classList.add('selecting-range');
     window.addEventListener('mouseup', onUp);
   }
 
+  function openLineComposer(line: ReviewDiffLine, event: MouseEvent) {
+    event.preventDefault();
+    event.stopPropagation();
+    selected = line;
+    rangeStart = line;
+    rangeEnd = line;
+    selectingRange = false;
+    composerAnchorLineId = line.id;
+    composerOpen = true;
+    void focusComposer();
+  }
+
   function updateLineSelection(line: ReviewDiffLine) {
     if (!selectingRange || !rangeStart || line.file_path !== rangeStart.file_path) return;
     rangeEnd = line;
     selected = line;
+    composerAnchorLineId = line.id;
   }
 
   function isLineRangeSelected(line: ReviewDiffLine) {
@@ -260,7 +291,7 @@
     const last = lines[lines.length - 1];
     return {
       file_path: first.file_path,
-      diff_line_id: first.id,
+      anchor_diff_line_id: first.id,
       old_line: first.old_line,
       new_line: first.new_line,
       range_start_old_line: first.old_line,
@@ -271,60 +302,150 @@
     };
   }
 
-  async function saveComment() {
+  async function focusComposer() {
+    await tick();
+    document.getElementById('inline-thread-body')?.focus();
+  }
+
+  function groupThreadsByLine(items: ReviewThreadRecord[]) {
+    const map = new Map<string, ReviewThreadRecord[]>();
+    for (const thread of items) {
+      const key = thread.anchor_diff_line_id;
+      if (!key) continue;
+      const list = map.get(key);
+      if (list) list.push(thread);
+      else map.set(key, [thread]);
+    }
+    return map;
+  }
+
+  function messageTypeLabel(type: string) {
+    return type
+      .split('_')
+      .map((part) => part.slice(0, 1).toUpperCase() + part.slice(1))
+      .join(' ');
+  }
+
+  async function createThread() {
     const range = rangePayload();
-    if (!range || !commentBody.trim()) return;
-    await api(`/api/review-sessions/${sessionId}/comments`, {
-      method: 'POST',
-      body: {
-        ...range,
-        body: commentBody,
-        status: 'open',
-        visibility: 'agent'
+    if (!range || !threadBody.trim()) return;
+    const data = await api<{ thread: ReviewThreadRecord }>(
+      `/api/review-sessions/${sessionId}/threads`,
+      {
+        method: 'POST',
+        body: {
+          ...range,
+          body: threadBody,
+          message_type: threadType,
+          status: 'open',
+          visibility: threadVisibility
+        }
       }
-    });
-    message = 'Comment saved.';
-    commentBody = '';
+    );
+    threads = [...threads, data.thread];
+    message = 'Thread saved.';
+    threadBody = '';
     selected = null;
     rangeStart = null;
     rangeEnd = null;
+    composerAnchorLineId = null;
+    composerOpen = false;
   }
 
-  async function saveNote() {
-    await api(`/api/review-sessions/${sessionId}/notes`, {
-      method: 'POST',
-      body: {
-        title: noteTitle,
-        body: noteBody,
-        note_type: 'thought',
-        status: 'draft',
-        visibility: 'agent',
-        source_context: selectedSourceContext()
-      }
-    });
-    noteTitle = '';
-    noteBody = '';
-    message = 'Note saved.';
+  function closeComposer() {
+    selected = null;
+    rangeStart = null;
+    rangeEnd = null;
+    composerAnchorLineId = null;
+    composerOpen = false;
+    threadBody = '';
   }
 
-  async function saveDecision() {
-    await api(`/api/review-sessions/${sessionId}/decisions`, {
-      method: 'POST',
-      body: {
-        title: decisionTitle,
-        context: decisionContext,
-        decision,
-        rationale,
-        status: 'accepted',
-        visibility: 'agent',
-        source_context: selectedSourceContext()
+  async function deleteThread(thread: ReviewThreadRecord) {
+    if (!confirm('Delete this thread and all its messages?')) return;
+    await api(`/api/review-threads/${thread.id}`, { method: 'DELETE' });
+    threads = threads.filter((item) => item.id !== thread.id);
+    if (activeThreadId === thread.id) activeThreadId = null;
+  }
+
+  async function resolveThread(thread: ReviewThreadRecord) {
+    await api(`/api/review-threads/${thread.id}/resolve`, { method: 'POST' });
+    threads = threads.map((item) =>
+      item.id === thread.id ? { ...item, status: 'resolved' } : item
+    );
+  }
+
+  async function reopenThread(thread: ReviewThreadRecord) {
+    await api(`/api/review-threads/${thread.id}/reopen`, { method: 'POST' });
+    threads = threads.map((item) => (item.id === thread.id ? { ...item, status: 'open' } : item));
+  }
+
+  async function dispatchBatch() {
+    if (dispatching) return;
+    dispatching = true;
+    message = 'Building feedback batch...';
+    try {
+      const data = await api<{ batch: FeedbackBatch }>(
+        `/api/review-sessions/${sessionId}/feedback-batches`,
+        { method: 'POST', body: {} }
+      );
+      lastBatch = data.batch;
+      batchPanelOpen = true;
+      message =
+        data.batch.thread_count === 0
+          ? 'No threads to dispatch.'
+          : `Batch queued: ${data.batch.thread_count} thread(s). Run wyrd_diff.pending_feedback in your agent.`;
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    } finally {
+      dispatching = false;
+    }
+  }
+
+  async function copyBatchPayload() {
+    if (!lastBatch) return;
+    await navigator.clipboard.writeText(lastBatch.payload);
+    message = 'Markdown payload copied.';
+  }
+
+  let refreshing = false;
+
+  async function refreshDiff() {
+    if (refreshing) return;
+    refreshing = true;
+    message = 'Refreshing diff...';
+    try {
+      await api(`/api/review-sessions/${sessionId}/refresh`, { method: 'POST', body: {} });
+      await load();
+      message = 'Diff refreshed.';
+    } catch (error) {
+      message = `Refresh failed: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      refreshing = false;
+    }
+  }
+
+  async function addReply(thread: ReviewThreadRecord) {
+    const body = replyBodies[thread.id]?.trim();
+    if (!body) return;
+    const data = await api<{ message: ReviewThreadRecord['messages'][number] }>(
+      `/api/review-threads/${thread.id}/messages`,
+      {
+        method: 'POST',
+        body: {
+          body,
+          message_type: 'comment',
+          author_kind: 'human',
+          status: 'open',
+          visibility: thread.visibility
+        }
       }
-    });
-    decisionTitle = '';
-    decisionContext = '';
-    decision = '';
-    rationale = '';
-    message = 'Decision saved.';
+    );
+    threads = threads.map((item) =>
+      item.id === thread.id ? { ...item, messages: [...item.messages, data.message] } : item
+    );
+    replyBodies = { ...replyBodies, [thread.id]: '' };
+    activeThreadId = thread.id;
   }
 
   load().catch((error) => {
@@ -332,14 +453,9 @@
   });
 </script>
 
-<main
-  class="review"
-  class:files-hidden={filesHidden}
-  class:side-hidden={sideHidden}
-  style:grid-template-columns={gridColumns}
->
+<main class="review" class:files-hidden={filesHidden} style:grid-template-columns={gridColumns}>
   <nav class="files" aria-hidden={filesHidden}>
-    <a class="home" href="/">Wyrd Mind</a>
+    <a class="home" href="/">Wyrd Diff</a>
     <button class="pane-toggle" on:click={() => (filesHidden = true)}>Hide files</button>
     <input bind:value={filter} placeholder="Filter files" />
     {#each visibleFiles as item (item.file.id)}
@@ -351,7 +467,7 @@
           skipped.delete(item.file.id);
           collapsed.delete(item.file.id);
           files = files;
-          document.getElementById(item.file.id)?.scrollIntoView({ block: 'start' });
+          scrollDiffTo(item.file.id);
         }}
       >
         <span>{item.file.path}</span>
@@ -365,26 +481,97 @@
     {/each}
   </nav>
 
-  <button
-    class="resizer left-resizer"
-    aria-label="Resize file sidebar"
-    on:mousedown={(event) => startResize('files', event)}
+  <button class="resizer left-resizer" aria-label="Resize file sidebar" on:mousedown={startResize}
   ></button>
 
   <section class="diff">
+    <div class="session-bar">
+      <strong>Session ID</strong>
+      <code>{sessionId}</code>
+      <div class="session-bar-spacer"></div>
+      <button
+        class="refresh-button"
+        disabled={refreshing}
+        title={session?.head_ref === 'WORKTREE'
+          ? 'Re-run git diff against the current working tree'
+          : 'Re-resolve refs and rebuild the diff snapshot'}
+        on:click={refreshDiff}
+      >
+        {refreshing ? 'Refreshing…' : 'Refresh diff'}
+      </button>
+      <button
+        class="dispatch-button"
+        class:armed={pendingThreadCount > 0}
+        disabled={dispatching || pendingThreadCount === 0}
+        title={pendingThreadCount === 0
+          ? 'No open threads with new reviewer input'
+          : 'Queue a feedback batch for wyrd_diff.pending_feedback'}
+        on:click={dispatchBatch}
+      >
+        {dispatching ? 'Dispatching...' : `Dispatch batch (${pendingThreadCount})`}
+      </button>
+      {#if lastBatch}
+        <button
+          class="dispatch-button"
+          on:click={() => (batchPanelOpen = !batchPanelOpen)}
+          title="Show queued batch markdown"
+        >
+          {batchPanelOpen ? 'Hide payload' : 'Show payload'}
+        </button>
+      {/if}
+    </div>
+    {#if batchPanelOpen && lastBatch}
+      <section class="batch-panel">
+        <header>
+          <div>
+            <strong>Feedback batch</strong>
+            <code>{lastBatch.id.slice(0, 8)}</code>
+            <span class="badge {lastBatch.status}">{lastBatch.status}</span>
+            <span>{lastBatch.thread_count} thread(s)</span>
+            {#if lastBatch.delivered_at}
+              <span>delivered {lastBatch.delivered_at}</span>
+            {:else}
+              <span>awaiting agent pull</span>
+            {/if}
+          </div>
+          <div>
+            <button on:click={copyBatchPayload}>Copy markdown</button>
+            <button on:click={() => (batchPanelOpen = false)}>Close</button>
+          </div>
+        </header>
+        <pre>{lastBatch.payload}</pre>
+        <p class="batch-hint">
+          In your running agent, call <code>wyrd_diff.pending_feedback</code> with
+          <code>session_id</code> = <code>{sessionId}</code>. The first call returns this markdown;
+          subsequent calls only return new replies past the watermark.
+        </p>
+      </section>
+    {/if}
     <div class="layout-controls">
       <button on:click={() => (filesHidden = !filesHidden)}>
         {filesHidden ? 'Show files' : 'Hide files'}
       </button>
-      <button on:click={() => (sideHidden = !sideHidden)}>
-        {sideHidden ? 'Show notes' : 'Hide notes'}
-      </button>
-      <a class="flow-link" href={`/trajectory/${sessionId}`}>Trajectory</a>
+      {#if message}<p class="message">{message}</p>{/if}
     </div>
     {#if session}
       <header>
-        <h1>{session.title}</h1>
-        <p>{session.base_ref} .. {session.head_ref}</p>
+        <h1>
+          {session.title}
+          {#if session.head_ref === 'WORKTREE'}
+            <span class="badge uncommitted" title="Includes staged + unstaged tracked changes"
+              >uncommitted</span
+            >
+          {/if}
+        </h1>
+        <p>
+          {session.base_ref} ..
+          {#if session.head_ref === 'WORKTREE'}
+            <span class="worktree-ref">working tree</span>
+            <small>({session.head_sha.slice(0, 7)} + uncommitted)</small>
+          {:else}
+            {session.head_ref}
+          {/if}
+        </p>
         <code>{apiBase}/api/review-sessions/{session.id}/agent-context</code>
       </header>
     {/if}
@@ -426,11 +613,144 @@
                       on:mousedown={(event) => startLineSelection(line, event)}
                       on:mouseenter={() => updateLineSelection(line)}
                     >
-                      <td class="num">{line.old_line ?? ''}</td>
+                      <td class="num line-action">
+                        <button
+                          class="add-thread"
+                          aria-label={`Add thread on ${line.file_path}:${line.new_line ?? line.old_line ?? ''}`}
+                          title="Add thread"
+                          on:mousedown={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                          }}
+                          on:click={(event) => openLineComposer(line, event)}
+                        >
+                          +
+                        </button>
+                        <span>{line.old_line ?? ''}</span>
+                      </td>
                       <td class="num">{line.new_line ?? ''}</td>
                       <!-- eslint-disable-next-line svelte/no-at-html-tags -- highlightedLine escapes raw text before injecting syntax spans -->
                       <td class="code">{@html highlightedLine(line)}</td>
                     </tr>
+                    {#if composerOpen && selectedLines.length > 0 && composerAnchorLineId === line.id}
+                      <tr class="composer-row">
+                        <td colspan="3">
+                          <section class="inline-composer">
+                            <div class="inline-composer-header">
+                              <div>
+                                <p>Add thread</p>
+                                <h3>{selectionLabel}</h3>
+                              </div>
+                              <button aria-label="Close composer" on:click={closeComposer}>x</button
+                              >
+                            </div>
+                            <div class="thread-meta">
+                              <span
+                                >{selectedLines.length} line{selectedLines.length === 1
+                                  ? ''
+                                  : 's'}</span
+                              >
+                              {#if composerAnchorLineId}
+                                <span>anchored</span>
+                              {/if}
+                            </div>
+                            <div class="composer-controls">
+                              <select bind:value={threadType}>
+                                <option value="comment">Comment</option>
+                                <option value="thinking_note">Thinking note</option>
+                                <option value="decision">Decision</option>
+                                <option value="agent_instruction">Agent instruction</option>
+                              </select>
+                              <select bind:value={threadVisibility}>
+                                <option value="agent">Agent-visible</option>
+                                <option value="private">Private</option>
+                              </select>
+                            </div>
+                            <textarea
+                              id="inline-thread-body"
+                              bind:value={threadBody}
+                              placeholder="Write a message"
+                              on:keydown={(event) => {
+                                if (event.key === 'Escape') closeComposer();
+                              }}
+                            ></textarea>
+                            <div class="composer-actions">
+                              <button on:click={createThread}>Save thread</button>
+                              <button on:click={closeComposer}>Cancel</button>
+                            </div>
+                          </section>
+                        </td>
+                      </tr>
+                    {/if}
+                    {#each threadsByLine.get(line.id) ?? [] as thread (thread.id)}
+                      <tr class="thread-row">
+                        <td colspan="3">
+                          <section
+                            class="thread"
+                            class:active={activeThreadId === thread.id}
+                            class:resolved={thread.status === 'resolved'}
+                            class:pending={isThreadPending(thread)}
+                          >
+                            <div class="thread-meta">
+                              <strong>{formatRangeLabel([line])}</strong>
+                              <span class="badge {thread.status}">{thread.status}</span>
+                              <span>{thread.visibility}</span>
+                              {#if isThreadPending(thread)}
+                                <span
+                                  class="badge pending"
+                                  title="Has new reviewer input past last delivery">queued</span
+                                >
+                              {/if}
+                              {#if thread.status === 'open'}
+                                <button
+                                  class="thread-action"
+                                  title="Mark resolved"
+                                  on:click={() => resolveThread(thread)}>Resolve</button
+                                >
+                              {:else}
+                                <button
+                                  class="thread-action"
+                                  title="Reopen thread"
+                                  on:click={() => reopenThread(thread)}>Reopen</button
+                                >
+                              {/if}
+                              <button
+                                class="thread-delete"
+                                aria-label="Delete thread"
+                                title="Delete thread"
+                                on:click={() => deleteThread(thread)}>Delete</button
+                              >
+                            </div>
+                            {#each thread.messages as threadMessage (threadMessage.id)}
+                              <article
+                                class="thread-message"
+                                class:agent={threadMessage.author_kind === 'agent'}
+                              >
+                                <div>
+                                  <strong
+                                    >{threadMessage.author_name ??
+                                      threadMessage.author_kind}</strong
+                                  >
+                                  <span>{messageTypeLabel(threadMessage.message_type)}</span>
+                                  {#if threadMessage.fix_import_id}
+                                    <code>fix {threadMessage.fix_import_id.slice(0, 8)}</code>
+                                  {/if}
+                                </div>
+                                <p>{threadMessage.body}</p>
+                              </article>
+                            {/each}
+                            <div class="reply">
+                              <textarea
+                                bind:value={replyBodies[thread.id]}
+                                placeholder="Follow up for the agent"
+                                on:focus={() => (activeThreadId = thread.id)}
+                              ></textarea>
+                              <button on:click={() => addReply(thread)}>Reply</button>
+                            </div>
+                          </section>
+                        </td>
+                      </tr>
+                    {/each}
                   {/each}
                 </tbody>
               </table>
@@ -440,63 +760,6 @@
       {/if}
     {/each}
   </section>
-
-  <button
-    class="resizer right-resizer"
-    aria-label="Resize note sidebar"
-    on:mousedown={(event) => startResize('side', event)}
-  ></button>
-
-  <aside class="side" aria-hidden={sideHidden}>
-    <button class="pane-toggle" on:click={() => (sideHidden = true)}>Hide notes</button>
-    <h2>Line comment</h2>
-    <div class="target">
-      {#if selectedLines.length > 0}
-        {selectionLabel}
-      {:else}
-        Select a diff line.
-      {/if}
-    </div>
-    <textarea bind:value={commentBody} placeholder="Comment"></textarea>
-    <button on:click={saveComment}>Save comment</button>
-
-    <h2>Thinking note</h2>
-    <div class="context-preview">
-      {#if selectedLines.length > 0}
-        Capturing context: {selectionLabel}
-        {#if selectedLines.length > 1}
-          ({selectedLines.length} lines)
-        {/if}
-      {:else}
-        No source line selected.
-      {/if}
-    </div>
-    <input bind:value={noteTitle} placeholder="Title" />
-    <textarea bind:value={noteBody} placeholder="What are you thinking?"></textarea>
-    <button on:click={saveNote}>Save note</button>
-
-    <h2>Decision</h2>
-    <div class="context-preview">
-      {#if selectedLines.length > 0}
-        Capturing context: {selectionLabel}
-        {#if selectedLines.length > 1}
-          ({selectedLines.length} lines)
-        {/if}
-      {:else}
-        No source line selected.
-      {/if}
-    </div>
-    <input bind:value={decisionTitle} placeholder="Title" />
-    <textarea bind:value={decisionContext} placeholder="Context"></textarea>
-    <textarea bind:value={decision} placeholder="Decision"></textarea>
-    <textarea bind:value={rationale} placeholder="Rationale"></textarea>
-    <button on:click={saveDecision}>Save decision</button>
-
-    <h2>Codex</h2>
-    <p>Tell Codex: address all comments in session <code>{sessionId}</code>.</p>
-    <p>Token: <code>{token}</code></p>
-    {#if message}<p class="message">{message}</p>{/if}
-  </aside>
 </main>
 
 <style>
@@ -513,35 +776,33 @@
     user-select: none;
   }
 
+  :global(html, body) {
+    height: 100%;
+    overflow: hidden;
+  }
+
   .review {
     display: grid;
-    min-height: 100vh;
+    height: 100vh;
+    max-height: 100vh;
+    overflow: hidden;
     background: var(--wm-bg);
     font-size: 13px;
   }
 
-  .files,
-  .side {
+  .files {
     position: sticky;
+    grid-column: 1;
     top: 0;
     height: 100vh;
     overflow: auto;
     background: var(--wm-surface);
     padding: 14px;
+    border-right: 1px solid var(--wm-border-strong);
+    box-shadow: 2px 0 16px rgba(124, 255, 158, 0.06);
   }
 
-  .files {
-    grid-column: 1;
-    border-right: 2px solid var(--wm-border-strong);
-  }
-
-  .side {
-    grid-column: 5;
-    border-left: 2px solid var(--wm-border-strong);
-  }
-
-  .review.files-hidden .files,
-  .review.side-hidden .side {
+  .review.files-hidden .files {
     display: none;
   }
 
@@ -555,25 +816,22 @@
     min-height: 0;
     padding: 0;
     border: 0;
-    border-left: 2px solid var(--wm-border);
-    border-right: 2px solid var(--wm-border);
+    border-left: 1px solid var(--wm-border);
+    border-right: 1px solid var(--wm-border);
     background: var(--wm-black);
     box-shadow: none;
     cursor: col-resize;
   }
 
   .resizer:hover {
-    background: var(--wm-green);
-    box-shadow: none;
+    background: rgba(124, 255, 158, 0.15);
+    box-shadow: 0 0 14px rgba(124, 255, 158, 0.4);
     transform: none;
+    border-color: var(--wm-green);
   }
 
   .left-resizer {
     grid-column: 2;
-  }
-
-  .right-resizer {
-    grid-column: 4;
   }
 
   .pane-toggle {
@@ -585,16 +843,24 @@
     display: block;
     margin-bottom: 14px;
     padding: 9px 10px;
-    border: 2px solid var(--wm-green);
-    color: var(--wm-ink);
+    border: 1px solid var(--wm-green);
+    color: var(--wm-green);
     font-weight: 900;
     font-size: 18px;
     line-height: 1;
     text-decoration: none;
-    box-shadow: 4px 4px 0 var(--wm-black);
+    box-shadow: var(--wm-glow-green-sm);
+    text-shadow: 0 0 10px rgba(124, 255, 158, 0.6);
+    letter-spacing: 0.04em;
+    transition: box-shadow 0.12s;
+  }
+
+  .home:hover {
+    box-shadow: var(--wm-glow-green);
   }
 
   input,
+  select,
   textarea {
     width: 100%;
     margin: 8px 0;
@@ -606,6 +872,14 @@
   textarea {
     min-height: 90px;
     resize: vertical;
+  }
+
+  select {
+    min-height: 34px;
+    border: 1px solid var(--wm-border);
+    background: var(--wm-bg);
+    color: var(--wm-ink);
+    font-weight: 800;
   }
 
   button {
@@ -629,10 +903,14 @@
     line-height: 1.2;
     box-shadow: none;
     text-align: left;
+    transition:
+      border-color 0.1s,
+      box-shadow 0.1s;
   }
 
   .files button:hover {
-    box-shadow: 3px 3px 0 var(--wm-black);
+    border-color: var(--wm-green);
+    box-shadow: 0 0 8px rgba(124, 255, 158, 0.25);
   }
 
   .files button.skipped {
@@ -669,13 +947,159 @@
   }
 
   .diff {
+    position: relative;
+    isolation: isolate;
     grid-column: 3;
     min-width: 0;
     height: 100vh;
-    padding: 16px;
+    padding: 0 8px 16px;
     overflow: auto;
-    background: linear-gradient(rgba(124, 255, 158, 0.025) 1px, transparent 1px), var(--wm-bg);
-    background-size: 100% 34px;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+    background: var(--wm-bg);
+  }
+
+  .session-bar {
+    position: sticky;
+    top: 0;
+    z-index: 40;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    min-height: 44px;
+    margin: 0 -16px 12px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--wm-border-strong);
+    background: var(--wm-surface);
+    font: 12px/1.25 var(--wm-mono);
+  }
+
+  .session-bar strong {
+    color: var(--wm-green);
+    text-transform: uppercase;
+    text-shadow: 0 0 8px rgba(124, 255, 158, 0.6);
+    letter-spacing: 0.06em;
+  }
+
+  .session-bar-spacer {
+    flex: 1;
+  }
+
+  .dispatch-button {
+    min-height: 26px;
+    padding: 4px 10px;
+    border: 1px solid var(--wm-border-strong);
+    background: var(--wm-bg);
+    color: var(--wm-ink);
+    box-shadow: none;
+    font: 700 11px/1.2 var(--wm-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    white-space: nowrap;
+  }
+
+  .dispatch-button.armed {
+    color: var(--wm-amber);
+    border-color: var(--wm-amber);
+    box-shadow: var(--wm-glow-amber);
+  }
+
+  .dispatch-button:disabled {
+    color: var(--wm-subtle);
+    border-color: var(--wm-border);
+    box-shadow: none;
+    cursor: not-allowed;
+  }
+
+  .dispatch-button:not(:disabled):hover {
+    border-color: var(--wm-green);
+    box-shadow: var(--wm-glow-green-sm);
+  }
+
+  .refresh-button {
+    min-height: 26px;
+    padding: 4px 10px;
+    margin-right: 6px;
+    border: 1px solid var(--wm-border-strong);
+    background: var(--wm-bg);
+    color: var(--wm-ink);
+    font: 700 11px/1.2 var(--wm-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    white-space: nowrap;
+  }
+
+  .refresh-button:not(:disabled):hover {
+    border-color: var(--wm-green);
+    color: var(--wm-green);
+    box-shadow: var(--wm-glow-green-sm);
+  }
+
+  .refresh-button:disabled {
+    color: var(--wm-subtle);
+    border-color: var(--wm-border);
+    cursor: not-allowed;
+  }
+
+  .batch-panel {
+    margin: 0 0 12px;
+    padding: 12px;
+    border: 1px solid var(--wm-amber);
+    background: var(--wm-surface);
+    box-shadow: var(--wm-glow-amber);
+    font: 12px/1.45 var(--wm-mono);
+  }
+
+  .batch-panel header {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    margin: 0 0 8px;
+    padding: 0 0 8px;
+    border: 0;
+    border-bottom: 1px solid var(--wm-border);
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .batch-panel header > div {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .batch-panel header strong {
+    color: var(--wm-green);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .batch-panel pre {
+    max-height: 320px;
+    margin: 0 0 8px;
+    padding: 10px;
+    border: 1px solid var(--wm-border);
+    background: var(--wm-bg);
+    color: var(--wm-ink);
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .batch-hint {
+    margin: 0;
+    color: var(--wm-muted);
+    font-size: 11px;
+  }
+
+  .batch-hint code {
+    padding: 1px 4px;
+    border: 1px solid var(--wm-border);
+    background: var(--wm-bg);
+    color: var(--wm-green);
   }
 
   .layout-controls {
@@ -685,18 +1109,17 @@
     align-items: center;
     margin: 0 0 12px;
     padding: 5px;
-    border: 2px solid var(--wm-border);
+    border: 1px solid var(--wm-border);
     background: var(--wm-surface);
   }
 
-  .layout-controls button,
-  .flow-link {
+  .layout-controls button {
     min-height: 24px;
     padding: 4px 7px;
-    border: 2px solid var(--wm-border-strong);
+    border: 1px solid var(--wm-border-strong);
     background: var(--wm-ink);
     color: var(--wm-black);
-    box-shadow: 2px 2px 0 var(--wm-black);
+    box-shadow: var(--wm-glow-green-sm);
     font-size: 11px;
     font-weight: 800;
     line-height: 1;
@@ -704,22 +1127,38 @@
     white-space: nowrap;
   }
 
-  .layout-controls button:hover,
-  .flow-link:hover {
-    box-shadow: 3px 3px 0 var(--wm-black);
+  .layout-controls button:hover {
+    box-shadow: var(--wm-glow-green);
   }
 
   header,
   article {
     margin-bottom: 16px;
-    border: 2px solid var(--wm-border-strong);
+    border: 1px solid var(--wm-border-strong);
     background: var(--wm-surface);
-    box-shadow: 4px 4px 0 var(--wm-black);
+    box-shadow: 0 0 16px rgba(124, 255, 158, 0.06);
+  }
+
+  article {
+    content-visibility: auto;
+    contain-intrinsic-size: 600px 1200px;
+    contain: layout paint style;
+  }
+
+  article.collapsed {
+    contain-intrinsic-size: 600px 60px;
   }
 
   header {
     padding: 14px;
     border-color: var(--wm-green);
+    box-shadow: 0 0 18px rgba(124, 255, 158, 0.18);
+  }
+
+  header h1 {
+    color: var(--wm-green);
+    text-shadow: 0 0 14px rgba(124, 255, 158, 0.7);
+    letter-spacing: 0.02em;
   }
 
   h1,
@@ -733,7 +1172,7 @@
     justify-content: space-between;
     gap: 12px;
     padding: 8px 10px;
-    border-bottom: 2px solid var(--wm-border);
+    border-bottom: 1px solid var(--wm-border);
     font-size: 13px;
     line-height: 1.3;
   }
@@ -749,7 +1188,7 @@
     display: grid;
     gap: 10px;
     padding: 16px;
-    border-top: 2px dashed var(--wm-border);
+    border-top: 1px dashed var(--wm-border);
     background: var(--wm-bg);
   }
 
@@ -781,16 +1220,21 @@
 
   tr.add {
     background: var(--wm-green-bg);
+    box-shadow: inset 3px 0 0 var(--wm-green);
   }
 
   tr.del {
     background: var(--wm-red-bg);
+    box-shadow: inset 3px 0 0 var(--wm-red);
   }
 
   tr.selected {
     background: var(--wm-amber-bg);
-    outline: 2px solid var(--wm-amber);
-    outline-offset: -2px;
+    outline: 1px solid var(--wm-amber);
+    outline-offset: -1px;
+    box-shadow:
+      inset 0 0 0 1px var(--wm-amber),
+      0 0 16px rgba(255, 209, 102, 0.35);
   }
 
   tr.range-selected {
@@ -802,8 +1246,17 @@
     border-bottom: 1px solid rgba(255, 209, 102, 0.38);
   }
 
+  tr.thread-row,
+  tr.composer-row {
+    cursor: default;
+  }
+
+  tr.thread-row td,
+  tr.composer-row td {
+    background: var(--wm-bg);
+  }
+
   td {
-    border-bottom: 1px solid #263036;
     vertical-align: top;
     font:
       12px/1.55 ui-monospace,
@@ -818,11 +1271,50 @@
   }
 
   .num {
-    width: 52px;
-    padding: 0 8px;
-    color: var(--wm-muted);
+    width: 38px;
+    padding: 0 6px;
+    color: var(--wm-subtle);
     text-align: right;
     user-select: none;
+  }
+
+  .line-action {
+    position: relative;
+  }
+
+  .line-action span {
+    display: block;
+  }
+
+  .add-thread {
+    position: absolute;
+    top: 50%;
+    left: 2px;
+    z-index: 2;
+    width: 18px;
+    min-width: 18px;
+    min-height: 18px;
+    padding: 0;
+    border: 1px solid var(--wm-border-strong);
+    background: var(--wm-ink);
+    color: var(--wm-black);
+    box-shadow: var(--wm-glow-green-sm);
+    font-size: 13px;
+    line-height: 14px;
+    opacity: 0;
+    transform: translateY(-50%);
+  }
+
+  tr:hover .add-thread,
+  tr.selected .add-thread,
+  tr.range-selected .add-thread {
+    opacity: 1;
+  }
+
+  .add-thread:hover {
+    background: var(--wm-amber);
+    box-shadow: var(--wm-glow-amber);
+    transform: translateY(-50%);
   }
 
   .code {
@@ -888,22 +1380,241 @@
     color: var(--wm-purple);
   }
 
-  .target {
-    padding: 8px;
-    border: 2px solid var(--wm-border);
-    background: var(--wm-bg);
-    color: var(--wm-muted);
-    font: 12px/1.35 var(--wm-mono);
+  .thread {
+    margin: 8px 10px 12px;
+    padding: 10px;
+    border: 1px solid var(--wm-border);
+    background: var(--wm-surface);
+    box-shadow: 0 0 10px rgba(124, 255, 158, 0.06);
   }
 
-  .context-preview {
-    margin: 0 0 8px;
-    padding: 7px 8px;
-    border: 2px dashed var(--wm-border);
+  .thread.active {
+    border-color: var(--wm-amber);
+    box-shadow: var(--wm-glow-amber);
+  }
+
+  .thread-meta,
+  .composer-controls,
+  .composer-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .thread-meta {
+    margin-bottom: 8px;
     color: var(--wm-muted);
+    font: 11px/1.3 var(--wm-mono);
+  }
+
+  .thread-meta strong {
+    color: var(--wm-ink);
+  }
+
+  .thread-action,
+  .thread-delete {
+    min-height: 22px;
+    padding: 2px 8px;
+    border: 1px solid var(--wm-border);
     background: var(--wm-bg);
-    font: 11px/1.35 var(--wm-mono);
+    box-shadow: none;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .thread-action {
+    color: var(--wm-green);
+    margin-left: auto;
+  }
+
+  .thread-action:hover {
+    border-color: var(--wm-green);
+    box-shadow: var(--wm-glow-green-sm);
+  }
+
+  .thread-delete {
+    color: var(--wm-red);
+  }
+
+  .thread-meta .thread-action ~ .thread-delete {
+    margin-left: 0;
+  }
+
+  .thread-meta .thread-delete:only-of-type {
+    margin-left: auto;
+  }
+
+  .thread-delete:hover {
+    border-color: var(--wm-red);
+    box-shadow: 0 0 10px rgba(255, 90, 60, 0.4);
+  }
+
+  .thread.resolved {
+    opacity: 0.55;
+  }
+
+  .thread.resolved .thread-meta strong {
+    text-decoration: line-through;
+  }
+
+  .thread.pending {
+    border-color: var(--wm-amber);
+    box-shadow: 0 0 12px rgba(255, 209, 102, 0.18);
+  }
+
+  .badge {
+    padding: 2px 6px;
+    border: 1px solid var(--wm-border);
+    background: var(--wm-bg);
+    color: var(--wm-muted);
+    font: 700 10px/1.2 var(--wm-mono);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+
+  .badge.open {
+    color: var(--wm-green);
+    border-color: var(--wm-border-strong);
+  }
+
+  .badge.resolved {
+    color: var(--wm-subtle);
+  }
+
+  .badge.pending {
+    color: var(--wm-amber);
+    border-color: var(--wm-amber);
+    text-shadow: 0 0 6px rgba(255, 209, 102, 0.5);
+  }
+
+  .badge.delivered {
+    color: var(--wm-blue);
+    border-color: var(--wm-border-strong);
+  }
+
+  .badge.superseded {
+    color: var(--wm-subtle);
+  }
+
+  .badge.uncommitted {
+    margin-left: 10px;
+    padding: 3px 8px;
+    color: var(--wm-amber);
+    border-color: var(--wm-amber);
+    background: rgba(255, 209, 102, 0.08);
+    text-shadow: 0 0 6px rgba(255, 209, 102, 0.45);
+    vertical-align: middle;
+  }
+
+  .worktree-ref {
+    color: var(--wm-amber);
+    font-weight: 700;
+  }
+
+  header small {
+    color: var(--wm-muted);
+    font-family: var(--wm-mono);
+    font-size: 11px;
+    margin-left: 6px;
+  }
+
+  .thread-meta span,
+  .thread-message span,
+  .thread-message code {
+    padding: 2px 5px;
+    border: 1px solid var(--wm-border);
+    background: var(--wm-bg);
+    color: var(--wm-muted);
+    font: 10px/1.2 var(--wm-mono);
+  }
+
+  .thread-message {
+    margin: 8px 0;
+    padding: 8px;
+    border: 1px solid var(--wm-border);
+    background: var(--wm-bg);
+  }
+
+  .thread-message.agent {
+    border-color: var(--wm-purple);
+    background: rgba(138, 109, 240, 0.06);
+    box-shadow: 0 0 10px rgba(201, 167, 255, 0.12);
+  }
+
+  .thread-message div {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+  }
+
+  .thread-message p {
+    margin: 0;
+    white-space: pre-wrap;
     overflow-wrap: anywhere;
+  }
+
+  .reply {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: start;
+  }
+
+  .reply textarea,
+  .inline-composer textarea {
+    min-height: 70px;
+  }
+
+  .inline-composer {
+    margin: 8px 10px 12px 64px;
+    padding: 12px;
+    border: 1px solid var(--wm-green);
+    background: var(--wm-surface);
+    box-shadow: 0 0 22px rgba(124, 255, 158, 0.14);
+  }
+
+  .inline-composer-header {
+    display: flex;
+    gap: 16px;
+    align-items: start;
+    justify-content: space-between;
+    margin-bottom: 10px;
+  }
+
+  .inline-composer-header p {
+    color: var(--wm-green);
+    font-weight: 900;
+    text-transform: uppercase;
+  }
+
+  .inline-composer-header h3 {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.25;
+    overflow-wrap: anywhere;
+  }
+
+  .inline-composer-header button {
+    width: 34px;
+    min-width: 34px;
+  }
+
+  .inline-composer textarea {
+    min-height: 120px;
+  }
+
+  .composer-controls {
+    display: grid;
+    grid-template-columns: minmax(160px, 220px) minmax(140px, 180px);
+  }
+
+  .composer-actions {
+    justify-content: flex-start;
   }
 
   code {
@@ -921,33 +1632,8 @@
       grid-template-columns: minmax(220px, 290px) 8px minmax(0, 1fr) !important;
     }
 
-    .side {
-      grid-column: 1 / -1;
-      position: static;
-      height: auto;
-      border-top: 2px solid var(--wm-border-strong);
-      border-left: 0;
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 14px;
-      align-items: start;
-    }
-
-    .right-resizer {
-      display: none;
-    }
-
     .diff {
       grid-column: 3;
-    }
-
-    .side h2,
-    .side .target,
-    .side textarea,
-    .side input,
-    .side button,
-    .side p {
-      min-width: 0;
     }
 
     .diff {
@@ -965,8 +1651,7 @@
       display: block;
     }
 
-    .files,
-    .side {
+    .files {
       position: static;
       height: auto;
       border: 0;
@@ -982,21 +1667,25 @@
       max-height: 40vh;
     }
 
-    .side {
-      display: block;
-    }
-
     .diff {
-      padding: 10px;
+      padding: 0 10px 10px;
       height: auto;
       min-height: 0;
     }
 
+    .session-bar {
+      margin: 0 -10px 10px;
+    }
+
     h2 {
       position: sticky;
-      top: 0;
+      top: 44px;
       background: var(--wm-surface);
       z-index: 1;
+    }
+
+    .inline-composer {
+      margin-left: 10px;
     }
 
     .num {

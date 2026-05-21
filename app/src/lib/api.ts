@@ -47,6 +47,40 @@ export type CommentRecord = {
   visibility: string;
 };
 
+export type ThreadMessageRecord = {
+  id: string;
+  thread_id: string;
+  author_kind: string;
+  author_name: string | null;
+  message_type: string;
+  body: string;
+  status: string;
+  visibility: string;
+  fix_import_id: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ReviewThreadRecord = {
+  id: string;
+  session_id: string;
+  file_path: string;
+  anchor_diff_line_id: string | null;
+  old_line: number | null;
+  new_line: number | null;
+  range_start_old_line: number | null;
+  range_start_new_line: number | null;
+  range_end_old_line: number | null;
+  range_end_new_line: number | null;
+  selected_text: string | null;
+  status: string;
+  visibility: string;
+  created_at: string;
+  updated_at: string;
+  last_delivered_message_id: string | null;
+  messages: ThreadMessageRecord[];
+};
+
 export type NoteRecord = {
   id: string;
   repo_id: string | null;
@@ -74,6 +108,25 @@ export type DecisionRecord = {
   source_context: SourceContext | null;
 };
 
+export type FeedbackBatchThread = {
+  batch_id: string;
+  thread_id: string;
+  delivery_kind: string;
+  message_ids: string[];
+};
+
+export type FeedbackBatch = {
+  id: string;
+  session_id: string;
+  agent_session_id: string | null;
+  status: string;
+  payload: string;
+  thread_count: number;
+  created_at: string;
+  delivered_at: string | null;
+  threads: FeedbackBatchThread[];
+};
+
 export type FixImportRecord = {
   id: string;
   session_id: string;
@@ -94,6 +147,7 @@ export type AgentContext = {
   };
   session: ReviewSession;
   open_comments: CommentRecord[];
+  open_threads: ReviewThreadRecord[];
   accepted_decisions: DecisionRecord[];
   agent_visible_notes: NoteRecord[];
 };

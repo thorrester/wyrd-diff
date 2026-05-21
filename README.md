@@ -1,8 +1,8 @@
-# wyrd-mind
+# wyrd-diff
 
 Local review, decision, and code trajectory memory for branch-based engineering work.
 
-`wyrd-mind` stores review comments, private thinking notes, durable decisions, agent handoff packets, and accepted fix trajectory in a local SQLite database. Target repositories stay clean; engineering memory lives here.
+`wyrd-diff` stores review comments, private thinking notes, durable decisions, agent handoff packets, and accepted fix trajectory in a local SQLite database. Target repositories stay clean; engineering memory lives here.
 
 ## Development
 
@@ -38,31 +38,31 @@ mise run dev:mcp
 
 ## Agent Recording Hook
 
-Wyrd Mind can record agent fix trajectory automatically from Codex or Claude
+Wyrd Diff can record agent fix trajectory automatically from Codex or Claude
 Stop hooks. The hook is intentionally inert unless a review session is active:
 
 ```bash
-export WYRD_MIND_SESSION_ID="<review_session_id>"
-export WYRD_MIND_START_SHA="$(git rev-parse HEAD)"
-export WYRD_MIND_AGENT="codex"
+export WYRD_DIFF_SESSION_ID="<review_session_id>"
+export WYRD_DIFF_START_SHA="$(git rev-parse HEAD)"
+export WYRD_DIFF_AGENT="codex"
 ```
 
 When the agent finishes a turn, the hook records the current `HEAD` commit if it
-changed from `WYRD_MIND_START_SHA` and has not already been recorded for the
+changed from `WYRD_DIFF_START_SHA` and has not already been recorded for the
 session. It captures the fix commit diff, hook payload or response text, optional
 test JSON, and acceptance state.
 
 Manual equivalent:
 
 ```bash
-cargo run --manifest-path /path/to/wyrd-mind/Cargo.toml --locked -p wyrd-mind-cli -- \
+cargo run --manifest-path /path/to/wyrd-diff/Cargo.toml --locked -p wyrd-diff-cli -- \
   review record-fix <session_id> <commit_sha> agent-response.md tests.json
 ```
 
 Hook command:
 
 ```bash
-cargo run --manifest-path /path/to/wyrd-mind/Cargo.toml --locked -p wyrd-mind-cli -- hook agent-stop
+cargo run --manifest-path /path/to/wyrd-diff/Cargo.toml --locked -p wyrd-diff-cli -- hook agent-stop
 ```
 
 Example configs:
