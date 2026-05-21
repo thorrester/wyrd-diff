@@ -68,6 +68,19 @@
   let collapsedFolders = new Set<string>();
 
   marked.setOptions({ gfm: true, breaks: false });
+  marked.use({
+    renderer: {
+      code({ text, lang }: { text: string; lang?: string }) {
+        const language = (lang ?? '').split(/\s/)[0];
+        const supported = language && hljs.getLanguage(language);
+        const html = supported
+          ? hljs.highlight(text, { language, ignoreIllegals: true }).value
+          : hljs.highlightAuto(text).value;
+        const cls = supported ? `hljs language-${language}` : 'hljs';
+        return `<pre><code class="${cls}">${html}</code></pre>`;
+      }
+    }
+  });
 
   type TreeNode =
     | { kind: 'dir'; name: string; path: string; children: TreeNode[]; additions: number; deletions: number; fileCount: number }
