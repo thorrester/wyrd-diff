@@ -588,7 +588,7 @@
     {#snippet renderNodes(nodes: TreeNode[], depth: number)}
       {#each nodes as node (node.kind === 'dir' ? `d:${node.path}` : `f:${node.item.file.id}`)}
         {#if node.kind === 'dir'}
-          {@const isOpen = !collapsedFolders.has(node.path)}
+          {@const isOpen = filter ? true : !collapsedFolders.has(node.path)}
           <button
             class="tree-row tree-dir"
             class:open={isOpen}
