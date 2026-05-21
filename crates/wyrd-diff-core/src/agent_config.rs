@@ -1,11 +1,24 @@
 //! Auto-configure agent harnesses (Claude Code, Codex, OpenCode, Gemini CLI,
-//! and others) to use the running Wyrd Diff MCP HTTP transport.
+//! and any user-defined harness) to use the running Wyrd Diff MCP HTTP
+//! transport.
 //!
-//! Each known harness is described by a `Harness` entry with a config file
-//! path and a `HarnessFormat`. The format drives read, write, and snippet
-//! generation. Adding a new harness is a single registry entry.
+//! Each harness is described by a [`Harness`] entry with a resolved config
+//! file path and a [`HarnessFormat`]. The format drives read, write, and
+//! snippet generation. Built-in harnesses live in [`built_in_harnesses`].
+//! Users can add their own at
+//! `$XDG_CONFIG_HOME/wyrd-diff/harnesses.toml` (or `~/.config/wyrd-diff/...`).
+//!
+//! ```toml
+//! [[harness]]
+//! id = "pi"
+//! display = "Pi"
+//! binary = "pi"
+//! path = "~/.pi/mcp.json"
+//! format = "claude-json"
+//! ```
 
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     env, fs,
@@ -18,26 +31,27 @@ pub const DEFAULT_MCP_URL: &str = "http://127.0.0.1:8765/mcp";
 /// Server name used inside every harness's config.
 pub const SERVER_NAME: &str = "wyrd-diff";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum HarnessFormat {
-    /// `~/.claude.json` — `mcpServers.<name> = { type: "http", url }`.
+    /// `mcpServers.<name> = { type: "http", url }` (Claude Code).
     ClaudeJson,
-    /// `~/.codex/config.toml` — `[mcp_servers.<name>]` with `url`.
+    /// `[mcp_servers.<name>]` with `url` (Codex TOML).
     CodexToml,
-    /// `~/.config/opencode/opencode.json` — `mcp.<name> = { type: "remote", url, enabled }`.
+    /// `mcp.<name> = { type: "remote", url, enabled }` (OpenCode).
     OpencodeJson,
-    /// `~/.gemini/settings.json` — `mcpServers.<name> = { httpUrl }`.
+    /// `mcpServers.<name> = { httpUrl }` (Gemini CLI).
     GeminiJson,
 }
 
 #[derive(Debug, Clone)]
 pub struct Harness {
-    pub id: &'static str,
-    pub display: &'static str,
-    /// Binary name used for PATH detection.
-    pub binary: &'static str,
-    /// Segments relative to `$HOME` for the canonical config file.
-    pub path_segments: &'static [&'static str],
+    pub id: String,
+    pub display: String,
+    /// Optional binary name used for `PATH` detection.
+    pub binary: Option<String>,
+    /// Fully resolved path to the harness config file.
+    pub config_path: PathBuf,
     pub format: HarnessFormat,
 }
 
@@ -79,38 +93,121 @@ pub struct HarnessWrite {
     pub action: ConfigAction,
 }
 
-/// Registry of known agent harnesses.
-pub fn known_harnesses() -> Vec<Harness> {
+#[derive(Debug, Deserialize)]
+struct CustomRegistryFile {
+    #[serde(default)]
+    harness: Vec<CustomHarnessEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CustomHarnessEntry {
+    id: String,
+    display: String,
+    #[serde(default)]
+    binary: Option<String>,
+    path: String,
+    format: HarnessFormat,
+}
+
+/// Built-in harnesses shipped with Wyrd Diff. Paths are resolved against the
+/// supplied home directory.
+pub fn built_in_harnesses(home: &Path) -> Vec<Harness> {
     vec![
         Harness {
-            id: "claude",
-            display: "Claude Code",
-            binary: "claude",
-            path_segments: &[".claude.json"],
+            id: "claude".to_string(),
+            display: "Claude Code".to_string(),
+            binary: Some("claude".to_string()),
+            config_path: home.join(".claude.json"),
             format: HarnessFormat::ClaudeJson,
         },
         Harness {
-            id: "codex",
-            display: "Codex",
-            binary: "codex",
-            path_segments: &[".codex", "config.toml"],
+            id: "codex".to_string(),
+            display: "Codex".to_string(),
+            binary: Some("codex".to_string()),
+            config_path: home.join(".codex").join("config.toml"),
             format: HarnessFormat::CodexToml,
         },
         Harness {
-            id: "opencode",
-            display: "OpenCode",
-            binary: "opencode",
-            path_segments: &[".config", "opencode", "opencode.json"],
+            id: "opencode".to_string(),
+            display: "OpenCode".to_string(),
+            binary: Some("opencode".to_string()),
+            config_path: home.join(".config").join("opencode").join("opencode.json"),
             format: HarnessFormat::OpencodeJson,
         },
         Harness {
-            id: "gemini",
-            display: "Gemini CLI",
-            binary: "gemini",
-            path_segments: &[".gemini", "settings.json"],
+            id: "gemini".to_string(),
+            display: "Gemini CLI".to_string(),
+            binary: Some("gemini".to_string()),
+            config_path: home.join(".gemini").join("settings.json"),
             format: HarnessFormat::GeminiJson,
         },
     ]
+}
+
+/// Path to the user-defined harness registry file.
+pub fn user_registry_path(home: &Path) -> PathBuf {
+    user_registry_path_with(home, env::var_os("XDG_CONFIG_HOME").as_deref())
+}
+
+fn user_registry_path_with(home: &Path, xdg: Option<&std::ffi::OsStr>) -> PathBuf {
+    if let Some(xdg) = xdg.filter(|s| !s.is_empty()) {
+        return PathBuf::from(xdg).join("wyrd-diff").join("harnesses.toml");
+    }
+    home.join(".config")
+        .join("wyrd-diff")
+        .join("harnesses.toml")
+}
+
+/// Load user-defined harnesses. Missing file is not an error.
+///
+/// # Errors
+/// Returns an error when the file exists but cannot be parsed.
+pub fn user_harnesses(home: &Path) -> Result<Vec<Harness>> {
+    user_harnesses_with(home, env::var_os("XDG_CONFIG_HOME").as_deref())
+}
+
+fn user_harnesses_with(home: &Path, xdg: Option<&std::ffi::OsStr>) -> Result<Vec<Harness>> {
+    let path = user_registry_path_with(home, xdg);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let parsed: CustomRegistryFile =
+        toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
+    parsed
+        .harness
+        .into_iter()
+        .map(|entry| {
+            Ok(Harness {
+                id: entry.id,
+                display: entry.display,
+                binary: entry.binary,
+                config_path: expand_user_path(&entry.path, home),
+                format: entry.format,
+            })
+        })
+        .collect()
+}
+
+/// All known harnesses. User entries override built-ins on `id` collision.
+///
+/// # Errors
+/// Returns an error when the user registry exists but cannot be parsed.
+pub fn known_harnesses(home: &Path) -> Result<Vec<Harness>> {
+    known_harnesses_with(home, env::var_os("XDG_CONFIG_HOME").as_deref())
+}
+
+fn known_harnesses_with(home: &Path, xdg: Option<&std::ffi::OsStr>) -> Result<Vec<Harness>> {
+    let mut out = built_in_harnesses(home);
+    for entry in user_harnesses_with(home, xdg)? {
+        if let Some(slot) = out.iter_mut().find(|h| h.id == entry.id) {
+            *slot = entry;
+        } else {
+            out.push(entry);
+        }
+    }
+    Ok(out)
 }
 
 /// Inspect every known harness against the running bridge URL.
@@ -121,9 +218,10 @@ pub fn known_harnesses() -> Vec<Harness> {
 pub fn agent_status(expected_url: &str) -> Result<Vec<HarnessReport>> {
     let home = home_dir().context("failed to resolve home directory")?;
     let path_dirs = path_dirs();
-    known_harnesses()
-        .into_iter()
-        .map(|h| inspect(&h, &home, &path_dirs, expected_url))
+    let harnesses = known_harnesses(&home)?;
+    harnesses
+        .iter()
+        .map(|h| inspect(h, &path_dirs, expected_url))
         .collect()
 }
 
@@ -131,19 +229,19 @@ pub fn agent_status(expected_url: &str) -> Result<Vec<HarnessReport>> {
 /// when its config file exists or its binary is on `PATH`.
 ///
 /// # Errors
-/// Returns an error when the home directory cannot be resolved, or any write
-/// fails.
+/// Returns an error when the home directory cannot be resolved, the user
+/// registry cannot be parsed, or any write fails.
 pub fn configure_agents(url: &str) -> Result<Vec<HarnessWrite>> {
     let home = home_dir().context("failed to resolve home directory")?;
     let path_dirs = path_dirs();
+    let harnesses = known_harnesses(&home)?;
     let mut out = Vec::new();
-    for harness in known_harnesses() {
-        let path = config_path(&harness, &home);
-        let detected = path.exists() || binary_in_path(harness.binary, &path_dirs);
+    for harness in &harnesses {
+        let detected = harness.config_path.exists() || binary_detected(harness, &path_dirs);
         if !detected {
             continue;
         }
-        out.push(write_one(&harness, &path, url)?);
+        out.push(write_one(harness, url)?);
     }
     Ok(out)
 }
@@ -155,26 +253,19 @@ pub fn configure_agents(url: &str) -> Result<Vec<HarnessWrite>> {
 /// id is unknown, or the write fails.
 pub fn configure_agent(id: &str, url: &str) -> Result<HarnessWrite> {
     let home = home_dir().context("failed to resolve home directory")?;
-    let harness = known_harnesses()
+    let harness = known_harnesses(&home)?
         .into_iter()
         .find(|h| h.id == id)
         .with_context(|| format!("unknown harness: {id}"))?;
-    let path = config_path(&harness, &home);
-    write_one(&harness, &path, url)
+    write_one(&harness, url)
 }
 
-fn inspect(
-    harness: &Harness,
-    home: &Path,
-    path_dirs: &[PathBuf],
-    expected: &str,
-) -> Result<HarnessReport> {
-    let path = config_path(harness, home);
-    let detected = path.exists() || binary_in_path(harness.binary, path_dirs);
-    let (state, configured_url) = if !path.exists() {
+fn inspect(harness: &Harness, path_dirs: &[PathBuf], expected: &str) -> Result<HarnessReport> {
+    let detected = harness.config_path.exists() || binary_detected(harness, path_dirs);
+    let (state, configured_url) = if !harness.config_path.exists() {
         (AgentConfigState::NoFile, None)
     } else {
-        let url = read_url(harness, &path)?;
+        let url = read_url(harness)?;
         let state = match &url {
             Some(u) if u == expected => AgentConfigState::Ok,
             Some(_) => AgentConfigState::Mismatch,
@@ -183,27 +274,19 @@ fn inspect(
         (state, url)
     };
     Ok(HarnessReport {
-        id: harness.id.to_string(),
-        display: harness.display.to_string(),
-        path,
+        id: harness.id.clone(),
+        display: harness.display.clone(),
+        path: harness.config_path.clone(),
         detected,
         state,
         configured_url,
-        snippet: snippet_for(harness, expected),
+        snippet: snippet_for(harness.format, expected),
     })
 }
 
-fn config_path(harness: &Harness, home: &Path) -> PathBuf {
-    let mut path = home.to_path_buf();
-    for segment in harness.path_segments {
-        path.push(segment);
-    }
-    path
-}
-
-fn read_url(harness: &Harness, path: &Path) -> Result<Option<String>> {
-    let text =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+fn read_url(harness: &Harness) -> Result<Option<String>> {
+    let text = fs::read_to_string(&harness.config_path)
+        .with_context(|| format!("failed to read {}", harness.config_path.display()))?;
     Ok(match harness.format {
         HarnessFormat::ClaudeJson => json_url(&text, &["mcpServers", SERVER_NAME], &["url"])?,
         HarnessFormat::GeminiJson => {
@@ -214,7 +297,8 @@ fn read_url(harness: &Harness, path: &Path) -> Result<Option<String>> {
     })
 }
 
-fn write_one(harness: &Harness, path: &Path, url: &str) -> Result<HarnessWrite> {
+fn write_one(harness: &Harness, url: &str) -> Result<HarnessWrite> {
+    let path = harness.config_path.as_path();
     let existed = path.exists();
     let existing = if existed {
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?
@@ -242,8 +326,8 @@ fn write_one(harness: &Harness, path: &Path, url: &str) -> Result<HarnessWrite> 
         fs::write(path, &updated).with_context(|| format!("failed to write {}", path.display()))?;
     }
     Ok(HarnessWrite {
-        id: harness.id.to_string(),
-        display: harness.display.to_string(),
+        id: harness.id.clone(),
+        display: harness.display.clone(),
         path: path.to_path_buf(),
         action,
     })
@@ -411,8 +495,8 @@ fn toml_url(text: &str, header: &str) -> Option<String> {
     None
 }
 
-fn snippet_for(harness: &Harness, url: &str) -> String {
-    match harness.format {
+fn snippet_for(format: HarnessFormat, url: &str) -> String {
+    match format {
         HarnessFormat::ClaudeJson => format!(
             "{{\n  \"mcpServers\": {{\n    \"{SERVER_NAME}\": {{ \"type\": \"http\", \"url\": \"{url}\" }}\n  }}\n}}"
         ),
@@ -438,13 +522,30 @@ fn path_dirs() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-fn binary_in_path(name: &str, dirs: &[PathBuf]) -> bool {
+fn binary_detected(harness: &Harness, dirs: &[PathBuf]) -> bool {
+    let Some(name) = harness.binary.as_deref() else {
+        return false;
+    };
     dirs.iter().any(|dir| dir.join(name).is_file())
+}
+
+fn expand_user_path(raw: &str, home: &Path) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    if raw == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = raw.strip_prefix("$HOME/") {
+        return home.join(rest);
+    }
+    PathBuf::from(raw)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn upsert_toml_inserts_block_when_absent() {
@@ -496,12 +597,89 @@ mod tests {
     }
 
     #[test]
-    fn known_harnesses_have_unique_ids() {
-        let harnesses = known_harnesses();
-        let mut ids: Vec<&str> = harnesses.iter().map(|h| h.id).collect();
+    fn built_in_harnesses_have_unique_ids() {
+        let dir = tempdir().unwrap();
+        let list = built_in_harnesses(dir.path());
+        let mut ids: Vec<String> = list.iter().map(|h| h.id.clone()).collect();
+        let count = ids.len();
         ids.sort();
-        let len = ids.len();
         ids.dedup();
-        assert_eq!(ids.len(), len, "duplicate harness id");
+        assert_eq!(ids.len(), count, "duplicate built-in harness id");
+    }
+
+    #[test]
+    fn expand_user_path_resolves_tilde() {
+        let home = Path::new("/home/u");
+        assert_eq!(expand_user_path("~/.foo/bar", home), home.join(".foo/bar"));
+        assert_eq!(expand_user_path("~", home), home.to_path_buf());
+        assert_eq!(expand_user_path("$HOME/x.toml", home), home.join("x.toml"));
+        assert_eq!(
+            expand_user_path("/abs/path", home),
+            PathBuf::from("/abs/path")
+        );
+    }
+
+    #[test]
+    fn user_harnesses_loads_custom_entries() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let registry = home.join(".config").join("wyrd-diff");
+        fs::create_dir_all(&registry).unwrap();
+        let content = r#"
+[[harness]]
+id = "pi"
+display = "Pi"
+binary = "pi"
+path = "~/.pi/mcp.json"
+format = "claude-json"
+
+[[harness]]
+id = "custom"
+display = "Custom"
+path = "/abs/custom.toml"
+format = "codex-toml"
+"#;
+        fs::write(registry.join("harnesses.toml"), content).unwrap();
+        let list = user_harnesses_with(home, None).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, "pi");
+        assert_eq!(list[0].config_path, home.join(".pi/mcp.json"));
+        assert_eq!(list[0].format, HarnessFormat::ClaudeJson);
+        assert_eq!(list[1].config_path, PathBuf::from("/abs/custom.toml"));
+        assert_eq!(list[1].binary, None);
+    }
+
+    #[test]
+    fn user_registry_path_respects_xdg() {
+        let home = Path::new("/home/u");
+        let xdg = std::ffi::OsString::from("/tmp/xdg");
+        let path = user_registry_path_with(home, Some(xdg.as_os_str()));
+        assert_eq!(path, PathBuf::from("/tmp/xdg/wyrd-diff/harnesses.toml"));
+        let fallback = user_registry_path_with(home, None);
+        assert_eq!(
+            fallback,
+            PathBuf::from("/home/u/.config/wyrd-diff/harnesses.toml")
+        );
+    }
+
+    #[test]
+    fn known_harnesses_overrides_built_in_on_id_collision() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let registry = home.join(".config").join("wyrd-diff");
+        fs::create_dir_all(&registry).unwrap();
+        let content = r#"
+[[harness]]
+id = "claude"
+display = "Claude (overridden)"
+path = "/custom/claude.json"
+format = "claude-json"
+"#;
+        fs::write(registry.join("harnesses.toml"), content).unwrap();
+        let list = known_harnesses_with(home, None).unwrap();
+        let claude = list.iter().find(|h| h.id == "claude").unwrap();
+        assert_eq!(claude.display, "Claude (overridden)");
+        assert_eq!(claude.config_path, PathBuf::from("/custom/claude.json"));
+        assert_eq!(list.iter().filter(|h| h.id == "claude").count(), 1);
     }
 }

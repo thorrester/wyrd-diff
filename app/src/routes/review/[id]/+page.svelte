@@ -64,6 +64,12 @@
   let lastBatch: FeedbackBatch | null = null;
   let dispatching = false;
   let batchPanelOpen = false;
+  let collapsedBatchThreads = new Set<string>();
+  let copiedThreadId = '';
+  let copiedThreadTimer: ReturnType<typeof setTimeout> | undefined;
+  let batchPanelEl: HTMLElement | undefined;
+  let batchBannerVisible = false;
+  let batchBannerTimer: ReturnType<typeof setTimeout> | undefined;
   let previewMode = new Set<string>();
   let collapsedFolders = new Set<string>();
 
@@ -531,6 +537,11 @@
       );
       lastBatch = data.batch;
       batchPanelOpen = true;
+      collapsedBatchThreads = new Set();
+      flashBatchBanner();
+      requestAnimationFrame(() => {
+        batchPanelEl?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
       message =
         data.batch.thread_count === 0
           ? 'No threads to dispatch.'
@@ -542,10 +553,45 @@
     }
   }
 
+  function flashBatchBanner() {
+    batchBannerVisible = true;
+    if (batchBannerTimer) clearTimeout(batchBannerTimer);
+    batchBannerTimer = setTimeout(() => (batchBannerVisible = false), 6000);
+  }
+
   async function copyBatchPayload() {
     if (!lastBatch) return;
     await navigator.clipboard.writeText(lastBatch.payload);
     message = 'Markdown payload copied.';
+  }
+
+  function toggleBatchThread(threadId: string) {
+    const next = new Set(collapsedBatchThreads);
+    if (next.has(threadId)) next.delete(threadId);
+    else next.add(threadId);
+    collapsedBatchThreads = next;
+  }
+
+  function batchThreadSections(payload: string): string[] {
+    const parts = payload.split(/\n---\n+/);
+    return parts.slice(1).map((part) => part.trimStart());
+  }
+
+  function threadById(id: string): ReviewThreadRecord | undefined {
+    return threads.find((thread) => thread.id === id);
+  }
+
+  function threadAnchorLabel(thread: ReviewThreadRecord | undefined): string {
+    if (!thread) return '';
+    const line = thread.new_line ?? thread.old_line;
+    return line == null ? thread.file_path : `${thread.file_path}:${line}`;
+  }
+
+  async function copyBatchThread(threadId: string, section: string) {
+    await navigator.clipboard.writeText(section);
+    copiedThreadId = threadId;
+    if (copiedThreadTimer) clearTimeout(copiedThreadTimer);
+    copiedThreadTimer = setTimeout(() => (copiedThreadId = ''), 1500);
   }
 
   let refreshing = false;
@@ -677,20 +723,20 @@
       >
         {dispatching ? 'Dispatching...' : `Dispatch batch (${pendingThreadCount})`}
       </button>
-      {#if lastBatch}
+      {#if lastBatch && !batchPanelOpen}
         <button
           class="dispatch-button"
-          on:click={() => (batchPanelOpen = !batchPanelOpen)}
-          title="Show queued batch markdown"
+          on:click={() => (batchPanelOpen = true)}
+          title="Show last queued batch"
         >
-          {batchPanelOpen ? 'Hide payload' : 'Show payload'}
+          Show last batch
         </button>
       {/if}
     </div>
     {#if batchPanelOpen && lastBatch}
-      <section class="batch-panel">
+      <section class="batch-panel" bind:this={batchPanelEl}>
         <header>
-          <div>
+          <div class="batch-meta">
             <strong>Feedback batch</strong>
             <code>{lastBatch.id.slice(0, 8)}</code>
             <span class="badge {lastBatch.status}">{lastBatch.status}</span>
@@ -701,17 +747,62 @@
               <span>awaiting agent pull</span>
             {/if}
           </div>
-          <div>
-            <button on:click={copyBatchPayload}>Copy markdown</button>
-            <button on:click={() => (batchPanelOpen = false)}>Close</button>
+          <div class="batch-actions">
+            <button on:click={copyBatchPayload}>Copy full markdown</button>
+            <button on:click={() => (batchPanelOpen = false)} aria-label="Close batch panel">×</button>
           </div>
         </header>
-        <pre>{lastBatch.payload}</pre>
-        <p class="batch-hint">
-          In your running agent, call <code>wyrd_diff.pending_feedback</code> with
-          <code>session_id</code> = <code>{sessionId}</code>. The first call returns this markdown;
-          subsequent calls only return new replies past the watermark.
-        </p>
+        {#if batchBannerVisible}
+          <p class="batch-banner">
+            Batch queued. Agent must call
+            <code>wyrd_diff.pending_feedback</code>
+            with <code>session_id={sessionId}</code> to fetch.
+          </p>
+        {/if}
+        {#if lastBatch.thread_count === 0}
+          <p class="batch-empty">No open threads with new reviewer input.</p>
+        {:else}
+          {@const sections = batchThreadSections(lastBatch.payload)}
+          <ul class="batch-threads">
+            {#each lastBatch.threads as bt, idx}
+              {@const thread = threadById(bt.thread_id)}
+              {@const section = sections[idx] ?? ''}
+              {@const collapsed = collapsedBatchThreads.has(bt.thread_id)}
+              <li class="batch-thread" class:collapsed>
+                <button
+                  type="button"
+                  class="batch-thread-head"
+                  on:click={() => toggleBatchThread(bt.thread_id)}
+                  aria-expanded={!collapsed}
+                >
+                  <span class="caret">{collapsed ? '▶' : '▼'}</span>
+                  <span class="batch-thread-title">
+                    Thread {idx + 1} — {threadAnchorLabel(thread)}
+                  </span>
+                  <span class="batch-thread-meta">
+                    <span class="delivery">{bt.delivery_kind}</span>
+                    <span>{bt.message_ids.length} msg</span>
+                  </span>
+                </button>
+                {#if !collapsed}
+                  <div class="batch-thread-body">
+                    <div class="batch-thread-actions">
+                      <code class="thread-id">{bt.thread_id.slice(0, 8)}</code>
+                      <button
+                        type="button"
+                        class="ghost"
+                        on:click={() => copyBatchThread(bt.thread_id, section)}
+                      >
+                        {copiedThreadId === bt.thread_id ? 'copied' : 'copy thread'}
+                      </button>
+                    </div>
+                    <pre>{section}</pre>
+                  </div>
+                {/if}
+              </li>
+            {/each}
+          </ul>
+        {/if}
       </section>
     {/if}
     <div class="layout-controls">
@@ -1319,17 +1410,115 @@
     overflow-wrap: anywhere;
   }
 
-  .batch-hint {
-    margin: 0;
-    color: var(--wm-muted);
-    font-size: 11px;
+  .batch-banner {
+    margin: 0 0 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--wm-green);
+    background: rgba(124, 255, 158, 0.06);
+    color: var(--wm-ink);
+    font-size: 12px;
   }
 
-  .batch-hint code {
+  .batch-banner code {
     padding: 1px 4px;
     border: 1px solid var(--wm-border);
     background: var(--wm-bg);
     color: var(--wm-green);
+  }
+
+  .batch-empty {
+    margin: 0;
+    color: var(--wm-muted);
+    font-size: 12px;
+  }
+
+  .batch-threads {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 6px;
+  }
+
+  .batch-thread {
+    border: 1px solid var(--wm-border);
+    background: var(--wm-bg);
+  }
+
+  .batch-thread-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 8px 10px;
+    border: 0;
+    background: transparent;
+    color: var(--wm-ink);
+    font: 700 12px/1.2 var(--wm-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+    text-align: left;
+  }
+
+  .batch-thread-head:hover {
+    background: var(--wm-surface);
+  }
+
+  .caret {
+    color: var(--wm-muted);
+    font-size: 10px;
+    width: 12px;
+  }
+
+  .batch-thread-title {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .batch-thread-meta {
+    display: flex;
+    gap: 8px;
+    color: var(--wm-muted);
+    font-weight: 400;
+    text-transform: none;
+    letter-spacing: 0;
+  }
+
+  .delivery {
+    padding: 1px 5px;
+    border: 1px solid var(--wm-border);
+    color: var(--wm-amber);
+  }
+
+  .batch-thread-body {
+    padding: 0 10px 10px;
+    display: grid;
+    gap: 6px;
+  }
+
+  .batch-thread-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .thread-id {
+    color: var(--wm-muted);
+    font-size: 11px;
+  }
+
+  .batch-thread-body .ghost {
+    padding: 3px 8px;
+    background: transparent;
+    border: 1px solid var(--wm-border-strong);
+    color: var(--wm-ink);
+    font: 700 10px/1.2 var(--wm-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    cursor: pointer;
   }
 
   .layout-controls {
