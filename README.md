@@ -1,57 +1,132 @@
 # wyrd-diff
 
-Local review, decision, and code trajectory memory for branch-based engineering work.
+A local diff review tool that pipes your review back to the coding agent while it's still working. Comment on the diff, dispatch the batch, the agent picks it up on its next turn through MCP and applies fixes. No PR round-trip. No copy-paste into chat.
 
-`wyrd-diff` stores review comments, private thinking notes, durable decisions, agent handoff packets, and accepted fix trajectory in a local SQLite database. Target repositories stay clean; engineering memory lives here.
+## The problem
 
-## Development
+You're running an agent on a branch. It produces 12 file changes. You want to actually review the diff before merging, not just skim what the agent claims it did.
 
-All tasks are run through `mise`.
+Today, the loop sucks. You either:
+
+- Paste diffs into chat one at a time and steer in prose ("no, change line 47 to...").
+- Wait for a PR, leave GitHub comments, then ask the agent to read them back.
+- Give up on review and trust the agent.
+
+All three break the in-session feedback loop. The agent is right there with full context loaded. By the time you've copy-pasted line numbers into a chat box, that context is gone.
+
+wyrd-diff fixes that. You review the diff in a dense, fast desktop UI. You leave line-level comments. You hit "Dispatch batch". On the agent's next turn, it queries the MCP server, sees your queued feedback, and applies it. No context loss. No PR yet. The branch stays local until you're ready.
+
+It also keeps the byproducts. Notes, decisions, and accepted fix trajectory get persisted locally so you can export trajectory as JSONL when you want it, and ignore it when you don't.
+
+## What you get
+
+- A desktop review surface (Tauri + SvelteKit) for line-level comments on a diff between two refs in a local repo.
+- A local Axum bridge on `127.0.0.1:8765` (falls back to 8766..8774 if taken).
+- An MCP server over HTTP at `/mcp`. Wire it into Claude Code, Codex, OpenCode, Gemini, or a custom harness you define.
+- Pull-based feedback delivery. The agent calls `wyrd_diff.pending_feedback`, gets queued threads with per-thread watermarks, and only sees deltas. No duplicate fixes.
+- A Stop-hook recorder that links each agent commit back to the review that triggered it.
+- JSONL export of accepted trajectory.
+
+Target repo stays clean. No `.wyrd/` directory. No commits to scrub before pushing.
+
+## Quick start
+
+Requires Rust 1.91+, Node 24, pnpm 10. `mise` installs the toolchain.
 
 ```bash
 mise install
 mise run db:migrate
 mise run dev
-mise run check
 ```
 
-`mise run dev` opens the Tauri desktop app. The app starts the local
-`127.0.0.1:8765` bridge itself, so the normal desktop workflow does not require
-running a separate API server. Browser-only and API-only tasks remain available
-for debugging:
+`mise run dev` launches the Tauri desktop app. The app spawns the bridge itself, so no separate API process is needed.
+
+Once it's up, the status pill in the bottom-right shows bridge health and detected agent harnesses. Click "Wire" next to Claude, Codex, OpenCode, or Gemini and the MCP server config gets written to the right file (`~/.claude.json`, `~/.codex/config.toml`, etc.) with sibling entries preserved. Restart the agent client and `wyrd-diff` shows up as an available tool.
+
+## The loop
+
+1. Register a local repo.
+2. Start a review session against a base ref and head ref.
+3. Comment on exact diff lines. Each line discussion is a thread. Threads can have follow-up replies.
+4. When you have a coherent set of comments, hit "Dispatch batch". The threads are queued for delivery.
+5. The agent, on its next turn, calls `wyrd_diff.pending_feedback`. It receives the queued threads as a single markdown payload with per-thread sections.
+6. The agent applies fixes and commits.
+7. The Stop hook records the commit and links it to the review session.
+8. Mark fixes accepted or rejected. The session keeps going until the diff is what you want.
+
+Delivery is pull, not push. Dispatching a batch makes feedback available; it does not interrupt the agent. The agent fetches on its next turn. That matters because it works the same whether the agent is local, remote, headless, or interactive.
+
+Per-thread watermarks mean the agent never sees the same comment twice. Add a reply to a thread after the agent's first fix attempt and only the new message gets delivered next time.
+
+## Architecture
+
+```
+┌─────────────────────┐
+│  Tauri Desktop App  │  review UI, decisions, exports
+│  (SvelteKit)        │
+└─────────┬───────────┘
+          │ spawns
+          ▼
+┌─────────────────────┐         ┌──────────────────┐
+│  Local Axum Bridge  │ ◄─MCP── │  Agent Harness   │
+│  127.0.0.1:8765     │  HTTP   │  (Claude/Codex/  │
+│                     │         │   OpenCode/...)  │
+└─────────┬───────────┘         └──────────────────┘
+          │
+          ▼
+┌─────────────────────┐
+│  SQLite             │  reviews, threads, notes,
+│  .data/wyrd-diff.db │  decisions, fix trajectory
+└─────────────────────┘
+```
+
+Crates:
+
+- `wyrd-diff-core`: domain models, SQLite persistence, git/diff logic, export.
+- `wyrd-diff-api`: Axum routes for the desktop UI and MCP HTTP transport.
+- `wyrd-diff-cli`: CLI for hooks, migrations, agent wiring, standalone server.
+- `wyrd-diff-mcp`: agent-facing MCP tools.
+- `app/src-tauri`: Tauri shell, spawns the bridge on launch.
+- `app/src`: SvelteKit UI.
+
+Everything durable lives in `wyrd-diff-core`. The CLI, MCP, Axum, and Tauri layers are thin adapters. Swap the desktop shell for a web UI or replace MCP with another transport and the persistence layer does not move.
+
+## Agent wiring
+
+Three ways to wire an agent.
+
+### From the app
+
+The status pill detects installed harnesses and shows a "Wire" button per harness. Click it. Config gets written, sibling entries left alone.
+
+### From the CLI
 
 ```bash
-mise run dev:ui
-mise run dev:api
-mise run dev:mcp
+mise run configure:agents
 ```
 
-## Agent Setup (one-time)
+### Custom harness via TOML
 
-The Tauri app auto-starts the local bridge on `http://127.0.0.1:8765` which
-exposes the MCP HTTP transport at `/mcp`. After `mise run dev` is running:
+Drop this in `~/.config/wyrd-diff/harnesses.toml`:
 
-- Click **Configure Claude + Codex** on the home screen, **or**
-- Run `mise run configure:agents`
+```toml
+[[harness]]
+id = "my-harness"
+display = "My Harness"
+binary = "my-harness"
+config_path = "~/.my-harness/mcp.json"
+format = "claude-json"
+```
 
-Both write `~/.claude.json` (`mcpServers.wyrd-diff`) and `~/.codex/config.toml`
-(`[mcp_servers.wyrd-diff]`). Other MCP entries are left untouched. Restart your
-agent client to pick up the new server.
+Supported formats: `claude-json`, `codex-toml`, `opencode-json`, `gemini-json`. User entries override built-ins on id collision. Path expansion handles `~/`, `~`, `$HOME/`, and absolute paths.
 
-## First Workflow
+If config writing fails (permissions, unfamiliar schema), the app falls back to a copy-pasteable snippet for the harness format.
 
-1. Register a local git repository.
-2. Create a review session from a base ref and head ref.
-3. Comment on exact diff lines.
-4. Record notes and decisions without committing them to the target repo.
-5. Expose agent-ready context through the local API.
-6. Import resulting fix commits and test outcomes.
-7. Export accepted trajectory as JSONL.
+## Trajectory recording (optional)
 
-## Agent Recording Hook
+If you also want to capture which fixes landed and which were rejected, wire the Stop hook. It's inert unless a review session is active, so leaving it on is safe.
 
-Wyrd Diff can record agent fix trajectory automatically from Codex or Claude
-Stop hooks. The hook is intentionally inert unless a review session is active:
+Set the session env vars before the agent runs:
 
 ```bash
 export WYRD_DIFF_SESSION_ID="<review_session_id>"
@@ -59,19 +134,7 @@ export WYRD_DIFF_START_SHA="$(git rev-parse HEAD)"
 export WYRD_DIFF_AGENT="codex"
 ```
 
-When the agent finishes a turn, the hook records the current `HEAD` commit if it
-changed from `WYRD_DIFF_START_SHA` and has not already been recorded for the
-session. It captures the fix commit diff, hook payload or response text, optional
-test JSON, and acceptance state.
-
-Manual equivalent:
-
-```bash
-cargo run --manifest-path /path/to/wyrd-diff/Cargo.toml --locked -p wyrd-diff-cli -- \
-  review record-fix <session_id> <commit_sha> agent-response.md tests.json
-```
-
-Hook command:
+Point the harness's Stop hook at the CLI:
 
 ```bash
 cargo run --manifest-path /path/to/wyrd-diff/Cargo.toml --locked -p wyrd-diff-cli -- hook agent-stop
@@ -82,6 +145,38 @@ Example configs:
 - `examples/codex-hooks.json`
 - `examples/claude-settings.local.json`
 
-For Claude Code, put the hook in `.claude/settings.local.json` in the target
-repo. For Codex, put it in `.codex/hooks.json` in the target repo. Do not commit
-local session ids or machine-specific paths.
+For Claude Code, put the hook in `.claude/settings.local.json`. For Codex, `.codex/hooks.json`. Both go in the target repo. Do not commit them. They contain machine-specific paths and live session IDs.
+
+## Development
+
+```bash
+mise install
+mise run db:migrate
+mise run dev          # Tauri desktop + bridge
+mise run dev:ui       # SvelteKit only
+mise run dev:api      # Axum bridge only
+mise run dev:mcp      # MCP over stdio (for debugging)
+mise run check        # fmt + lint + typecheck + tests
+```
+
+Targeted Rust tests:
+
+```bash
+cargo test --locked -p wyrd-diff-core
+```
+
+Reset local DB if a migration goes sideways:
+
+```bash
+mise run db:reset
+```
+
+See `AGENTS.md` for ownership boundaries and contributor conventions.
+
+## Status
+
+Pre-1.0. APIs and schema can change. Migrations are forward-only with no automatic rollback. If you depend on the JSONL export shape, pin a commit.
+
+## License
+
+MIT.
