@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { tick } from 'svelte';
+  import { marked } from 'marked';
   import hljs from 'highlight.js/lib/core';
   import bash from 'highlight.js/lib/languages/bash';
   import css from 'highlight.js/lib/languages/css';
@@ -63,12 +64,111 @@
   let lastBatch: FeedbackBatch | null = null;
   let dispatching = false;
   let batchPanelOpen = false;
+  let previewMode = new Set<string>();
+  let collapsedFolders = new Set<string>();
+
+  marked.setOptions({ gfm: true, breaks: false });
+
+  type TreeNode =
+    | { kind: 'dir'; name: string; path: string; children: TreeNode[]; additions: number; deletions: number; fileCount: number }
+    | { kind: 'file'; name: string; path: string; item: ReviewFile };
+
+  function buildTree(list: ReviewFile[]): TreeNode[] {
+    type Dir = {
+      name: string;
+      path: string;
+      dirs: Map<string, Dir>;
+      files: ReviewFile[];
+    };
+    const root: Dir = { name: '', path: '', dirs: new Map(), files: [] };
+    for (const item of list) {
+      const segments = item.file.path.split('/');
+      let cursor = root;
+      for (let i = 0; i < segments.length - 1; i += 1) {
+        const seg = segments[i];
+        const dirPath = cursor.path ? `${cursor.path}/${seg}` : seg;
+        let next = cursor.dirs.get(seg);
+        if (!next) {
+          next = { name: seg, path: dirPath, dirs: new Map(), files: [] };
+          cursor.dirs.set(seg, next);
+        }
+        cursor = next;
+      }
+      cursor.files.push(item);
+    }
+    const sortDirs = (a: Dir, b: Dir) => a.name.localeCompare(b.name);
+    const sortFiles = (a: ReviewFile, b: ReviewFile) =>
+      a.file.path.localeCompare(b.file.path);
+    const collapseChain = (dir: Dir): Dir => {
+      while (dir.dirs.size === 1 && dir.files.length === 0) {
+        const [only] = dir.dirs.values();
+        only.name = `${dir.name}/${only.name}`;
+        only.path = only.path;
+        return collapseChain(only);
+      }
+      return dir;
+    };
+    const toNodes = (dir: Dir): TreeNode[] => {
+      const out: TreeNode[] = [];
+      const childDirs = Array.from(dir.dirs.values()).sort(sortDirs);
+      for (const child of childDirs) {
+        const collapsed = collapseChain(child);
+        const children = toNodes(collapsed);
+        let additions = 0;
+        let deletions = 0;
+        let fileCount = 0;
+        const visit = (nodes: TreeNode[]) => {
+          for (const node of nodes) {
+            if (node.kind === 'file') {
+              additions += node.item.file.additions;
+              deletions += node.item.file.deletions;
+              fileCount += 1;
+            } else {
+              additions += node.additions;
+              deletions += node.deletions;
+              fileCount += node.fileCount;
+            }
+          }
+        };
+        visit(children);
+        out.push({
+          kind: 'dir',
+          name: collapsed.name,
+          path: collapsed.path,
+          children,
+          additions,
+          deletions,
+          fileCount
+        });
+      }
+      for (const file of dir.files.slice().sort(sortFiles)) {
+        const name = file.file.path.split('/').pop() ?? file.file.path;
+        out.push({ kind: 'file', name, path: file.file.path, item: file });
+      }
+      return out;
+    };
+    return toNodes(root);
+  }
+
+  function toggleFolder(path: string) {
+    if (collapsedFolders.has(path)) collapsedFolders.delete(path);
+    else collapsedFolders.add(path);
+    collapsedFolders = new Set(collapsedFolders);
+  }
+
+  function openFile(item: ReviewFile) {
+    skipped.delete(item.file.id);
+    collapsed.delete(item.file.id);
+    files = files;
+    scrollDiffTo(item.file.id);
+  }
 
   $: sessionId = $page.params.id;
   $: gridColumns = `${filesHidden ? 0 : leftWidth}px 8px minmax(0, 1fr)`;
   $: visibleFiles = files.filter((item) =>
     item.file.path.toLowerCase().includes(filter.toLowerCase())
   );
+  $: fileTree = buildTree(visibleFiles);
   $: selectedLines = getSelectedRangeLines(files, selected, rangeStart, rangeEnd);
   $: selectedLineIds = new Set(selectedLines.map((line) => line.id));
   $: selectionLabel = formatRangeLabel(selectedLines);
@@ -105,6 +205,33 @@
     if (set.has(id)) set.delete(id);
     else set.add(id);
     files = files;
+  }
+
+  function isMarkdownFile(path: string) {
+    return /\.(md|mdx|markdown)$/i.test(path);
+  }
+
+  function reconstructMarkdown(item: ReviewFile): string {
+    const lines: { n: number; text: string }[] = [];
+    for (const hunk of item.hunks) {
+      for (const line of hunk.lines) {
+        if (line.new_line == null) continue;
+        if (line.line_kind !== 'add' && line.line_kind !== 'ctx') continue;
+        lines.push({ n: line.new_line, text: line.content.slice(1) });
+      }
+    }
+    lines.sort((a, b) => a.n - b.n);
+    return lines.map((entry) => entry.text).join('\n');
+  }
+
+  function renderMarkdown(item: ReviewFile): string {
+    return marked.parse(reconstructMarkdown(item), { async: false }) as string;
+  }
+
+  function togglePreview(fileId: string) {
+    if (previewMode.has(fileId)) previewMode.delete(fileId);
+    else previewMode.add(fileId);
+    previewMode = new Set(previewMode);
   }
 
   function scrollDiffTo(fileId: string) {
@@ -458,27 +585,54 @@
     <a class="home" href="/">Wyrd Diff</a>
     <button class="pane-toggle" on:click={() => (filesHidden = true)}>Hide files</button>
     <input bind:value={filter} placeholder="Filter files" />
-    {#each visibleFiles as item (item.file.id)}
-      <button
-        class:skipped={skipped.has(item.file.id)}
-        class:large={isLargeFile(item)}
-        class:hidden-large={isLargeHidden(item)}
-        on:click={() => {
-          skipped.delete(item.file.id);
-          collapsed.delete(item.file.id);
-          files = files;
-          scrollDiffTo(item.file.id);
-        }}
-      >
-        <span>{item.file.path}</span>
-        <small>
-          +{item.file.additions} -{item.file.deletions}
-          {#if isLargeHidden(item)}
-            <em>hidden</em>
+    {#snippet renderNodes(nodes: TreeNode[], depth: number)}
+      {#each nodes as node (node.kind === 'dir' ? `d:${node.path}` : `f:${node.item.file.id}`)}
+        {#if node.kind === 'dir'}
+          {@const isOpen = !collapsedFolders.has(node.path)}
+          <button
+            class="tree-row tree-dir"
+            class:open={isOpen}
+            style:--depth={depth}
+            on:click={() => toggleFolder(node.path)}
+          >
+            <span class="tree-label">
+              <span class="tree-caret" aria-hidden="true">{isOpen ? '▾' : '▸'}</span>
+              <span class="tree-name">{node.name}</span>
+            </span>
+            <small>
+              <em class="tree-count">{node.fileCount}</em>
+              <span class="adds">+{node.additions}</span>
+              <span class="dels">-{node.deletions}</span>
+            </small>
+          </button>
+          {#if isOpen}
+            {@render renderNodes(node.children, depth + 1)}
           {/if}
-        </small>
-      </button>
-    {/each}
+        {:else}
+          <button
+            class="tree-row tree-file"
+            class:skipped={skipped.has(node.item.file.id)}
+            class:large={isLargeFile(node.item)}
+            class:hidden-large={isLargeHidden(node.item)}
+            style:--depth={depth}
+            on:click={() => openFile(node.item)}
+          >
+            <span class="tree-label">
+              <span class="tree-caret" aria-hidden="true"></span>
+              <span class="tree-name">{node.name}</span>
+            </span>
+            <small>
+              <span class="adds">+{node.item.file.additions}</span>
+              <span class="dels">-{node.item.file.deletions}</span>
+              {#if isLargeHidden(node.item)}
+                <em>hidden</em>
+              {/if}
+            </small>
+          </button>
+        {/if}
+      {/each}
+    {/snippet}
+    {@render renderNodes(fileTree, 0)}
   </nav>
 
   <button class="resizer left-resizer" aria-label="Resize file sidebar" on:mousedown={startResize}
@@ -582,6 +736,15 @@
           <h2>
             <span>{item.file.path}</span>
             <span>
+              {#if isMarkdownFile(item.file.path) && !isLargeHidden(item)}
+                <button
+                  class:active={previewMode.has(item.file.id)}
+                  on:click={() => togglePreview(item.file.id)}
+                  title="Render markdown from the head-side content"
+                >
+                  {previewMode.has(item.file.id) ? 'Show diff' : 'Preview MD'}
+                </button>
+              {/if}
               {#if isLargeHidden(item)}
                 <button on:click={() => showLargeFile(item.file.id)}>Show diff</button>
               {:else}
@@ -601,6 +764,9 @@
               </p>
               <button on:click={() => showLargeFile(item.file.id)}>Show diff</button>
             </div>
+          {:else if !collapsed.has(item.file.id) && previewMode.has(item.file.id)}
+            <!-- eslint-disable-next-line svelte/no-at-html-tags -- markdown is reconstructed from the head-side diff for a local repo -->
+            <div class="md-preview">{@html renderMarkdown(item)}</div>
           {:else if !collapsed.has(item.file.id)}
             {#each item.hunks as hunk (hunk.id)}
               <table>
@@ -889,44 +1055,77 @@
     line-height: 1;
   }
 
-  .files button {
+  .files .tree-row {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
-    gap: 8px;
+    gap: 6px;
+    align-items: center;
     width: 100%;
-    margin: 6px 0;
-    border-color: var(--wm-border);
-    background: var(--wm-bg);
+    min-height: 24px;
+    margin: 0;
+    padding: 3px 6px 3px calc(6px + var(--depth, 0) * 12px);
+    border: 0;
+    background: transparent;
     color: var(--wm-ink);
     font-size: 12px;
-    font-weight: 700;
+    font-weight: 600;
     line-height: 1.2;
     box-shadow: none;
     text-align: left;
-    transition:
-      border-color 0.1s,
-      box-shadow 0.1s;
+    cursor: pointer;
+    transition: background 0.08s;
   }
 
-  .files button:hover {
-    border-color: var(--wm-green);
-    box-shadow: 0 0 8px rgba(124, 255, 158, 0.25);
+  .files .tree-row:hover {
+    background: rgba(124, 255, 158, 0.07);
+    border-color: transparent;
+    box-shadow: none;
+    transform: none;
   }
 
-  .files button.skipped {
-    opacity: 0.55;
+  .files .tree-row:active {
+    transform: none;
+  }
+
+  .files .tree-row.skipped {
+    opacity: 0.45;
     text-decoration: line-through;
   }
 
-  .files button.large {
-    border-style: dashed;
+  .files .tree-row.large .tree-name {
+    border-bottom: 1px dashed var(--wm-border-strong);
   }
 
-  .files button.hidden-large {
-    border-color: var(--wm-amber);
+  .files .tree-row.hidden-large .tree-name {
+    color: var(--wm-amber);
   }
 
-  .files span {
+  .files .tree-dir {
+    font-weight: 800;
+    color: var(--wm-muted);
+    text-transform: none;
+  }
+
+  .files .tree-dir.open {
+    color: var(--wm-ink);
+  }
+
+  .tree-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .tree-caret {
+    display: inline-block;
+    width: 10px;
+    color: var(--wm-subtle);
+    font-size: 10px;
+    text-align: center;
+  }
+
+  .tree-name {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -937,7 +1136,25 @@
     gap: 6px;
     align-items: center;
     color: var(--wm-muted);
+    font-family: var(--wm-mono);
+    font-size: 11px;
     white-space: nowrap;
+  }
+
+  .files .tree-count {
+    padding: 0 4px;
+    border: 1px solid var(--wm-border);
+    color: var(--wm-subtle);
+    font-style: normal;
+    font-size: 10px;
+  }
+
+  .files .adds {
+    color: var(--wm-green);
+  }
+
+  .files .dels {
+    color: var(--wm-red);
   }
 
   .files em {
@@ -952,7 +1169,7 @@
     grid-column: 3;
     min-width: 0;
     height: 100vh;
-    padding: 0 8px 16px;
+    padding: 0 6px 16px 0;
     overflow: auto;
     overscroll-behavior: contain;
     scrollbar-gutter: stable;
@@ -967,8 +1184,8 @@
     gap: 10px;
     align-items: center;
     min-height: 44px;
-    margin: 0 -16px 12px;
-    padding: 10px 16px;
+    margin: 0 -6px 12px 0;
+    padding: 10px 12px;
     border-bottom: 1px solid var(--wm-border-strong);
     background: var(--wm-surface);
     font: 12px/1.25 var(--wm-mono);
@@ -1184,6 +1401,110 @@
     white-space: nowrap;
   }
 
+  .md-preview {
+    padding: 14px 18px;
+    color: var(--wm-ink);
+    font:
+      14px/1.55 var(--wm-font),
+      system-ui;
+    background: var(--wm-bg);
+    overflow-wrap: anywhere;
+  }
+
+  .md-preview :global(h1),
+  .md-preview :global(h2),
+  .md-preview :global(h3),
+  .md-preview :global(h4) {
+    margin: 18px 0 8px;
+    color: var(--wm-green);
+    text-shadow: 0 0 8px rgba(124, 255, 158, 0.25);
+  }
+
+  .md-preview :global(h1) {
+    font-size: 22px;
+  }
+  .md-preview :global(h2) {
+    font-size: 18px;
+  }
+  .md-preview :global(h3) {
+    font-size: 15px;
+  }
+
+  .md-preview :global(p),
+  .md-preview :global(ul),
+  .md-preview :global(ol),
+  .md-preview :global(blockquote),
+  .md-preview :global(table) {
+    margin: 8px 0;
+  }
+
+  .md-preview :global(ul),
+  .md-preview :global(ol) {
+    padding-left: 22px;
+  }
+
+  .md-preview :global(blockquote) {
+    padding: 6px 12px;
+    border-left: 3px solid var(--wm-amber);
+    color: var(--wm-muted);
+    background: rgba(255, 209, 102, 0.05);
+  }
+
+  .md-preview :global(code) {
+    padding: 1px 5px;
+    background: var(--wm-surface-2);
+    border: 1px solid var(--wm-border);
+    color: var(--wm-amber);
+    font-family: var(--wm-mono);
+    font-size: 12.5px;
+  }
+
+  .md-preview :global(pre) {
+    padding: 10px 12px;
+    background: var(--wm-black);
+    border: 1px solid var(--wm-border);
+    overflow-x: auto;
+  }
+
+  .md-preview :global(pre code) {
+    padding: 0;
+    background: transparent;
+    border: 0;
+    color: var(--wm-ink);
+  }
+
+  .md-preview :global(table) {
+    width: auto;
+    border-collapse: collapse;
+  }
+
+  .md-preview :global(th),
+  .md-preview :global(td) {
+    padding: 4px 10px;
+    border: 1px solid var(--wm-border);
+  }
+
+  .md-preview :global(a) {
+    color: var(--wm-blue);
+    text-decoration: underline;
+  }
+
+  .md-preview :global(hr) {
+    border: 0;
+    border-top: 1px solid var(--wm-border);
+    margin: 16px 0;
+  }
+
+  .md-preview :global(img) {
+    max-width: 100%;
+  }
+
+  h2 button.active {
+    border-color: var(--wm-amber);
+    color: var(--wm-amber);
+    box-shadow: var(--wm-glow-amber);
+  }
+
   .large-diff {
     display: grid;
     gap: 10px;
@@ -1271,11 +1592,16 @@
   }
 
   .num {
-    width: 38px;
-    padding: 0 6px;
+    width: 30px;
+    padding: 0 4px;
     color: var(--wm-subtle);
     text-align: right;
     user-select: none;
+  }
+
+  .num.line-action {
+    width: 26px;
+    padding: 0 2px;
   }
 
   .line-action {
