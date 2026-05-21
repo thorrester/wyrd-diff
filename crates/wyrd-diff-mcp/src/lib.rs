@@ -106,11 +106,16 @@ fn create_review_session(db: &Database, args: Value) -> Result<Value> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| format!("{base_ref}..{head_ref}"));
+    let branch = args
+        .get("branch")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let session = db.create_review_session(NewReviewSession {
         repo_id,
         title,
         base_ref: base_ref.to_string(),
         head_ref: head_ref.to_string(),
+        branch,
     })?;
     Ok(json!({
         "review_session": session,
@@ -214,14 +219,24 @@ fn resolve_session_id(db: &Database, args: &Value) -> Result<String> {
     if let Some(session_id) = args.get("session_id").and_then(Value::as_str) {
         return Ok(session_id.to_string());
     }
+    if let Some(agent_session_id) = args.get("agent_session_id").and_then(Value::as_str) {
+        let agent_name = args
+            .get("agent_name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if let Some(linked) = db.linked_review_session_for_agent(agent_session_id, agent_name)? {
+            return Ok(linked);
+        }
+    }
     if let Some(path) = args.get("repo_path").and_then(Value::as_str) {
+        let branch = args.get("branch").and_then(Value::as_str);
         let active = db
-            .active_review_session_for_repo_path(path)?
+            .active_review_session_for_repo_path(path, branch)?
             .with_context(|| format!("no active review session for repo: {path}"))?;
         return Ok(active.session.id);
     }
     Err(anyhow::anyhow!(
-        "missing required argument: session_id (or repo_path with an active session)"
+        "missing required argument: session_id (or agent_session_id + agent_name, or repo_path)"
     ))
 }
 

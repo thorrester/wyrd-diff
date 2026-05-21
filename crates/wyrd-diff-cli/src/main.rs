@@ -64,11 +64,13 @@ async fn main() -> Result<()> {
                     .next()
                     .unwrap_or_else(|| format!("{base_ref}..{head_ref}"));
                 db.migrate()?;
+                let branch = args.next();
                 let session = db.create_review_session(NewReviewSession {
                     repo_id,
                     title,
                     base_ref,
                     head_ref,
+                    branch,
                 })?;
                 println!("{}", serde_json::to_string_pretty(&session)?);
                 Ok(())

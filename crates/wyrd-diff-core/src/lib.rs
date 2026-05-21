@@ -9,8 +9,8 @@ pub mod git;
 pub mod models;
 
 pub use db::{
-    Database, NewComment, NewDecision, NewFixImport, NewNote, NewRepo, NewReviewSession,
-    NewReviewThread, NewThreadMessage,
+    Database, NewAgentSession, NewComment, NewDecision, NewFixImport, NewNote, NewRepo,
+    NewReviewSession, NewReviewThread, NewThreadMessage,
 };
 pub use export::{AgentContext, TrajectoryRecord};
 pub use git::{DiffFile, DiffHunk, DiffLine, GitRepo};

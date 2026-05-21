@@ -1,8 +1,8 @@
 //! SQLite persistence.
 
 use crate::{
-    ActiveReviewSessionRecord, FeedbackBatchRecord, FeedbackBatchThreadRecord, FileRecord,
-    FixImportRecord, GitRepo, RepoRecord, ReviewDiffLine, ReviewFileDiff, ReviewHunk,
+    ActiveReviewSessionRecord, AgentSessionRecord, FeedbackBatchRecord, FeedbackBatchThreadRecord,
+    FileRecord, FixImportRecord, GitRepo, RepoRecord, ReviewDiffLine, ReviewFileDiff, ReviewHunk,
     ReviewSessionRecord, ReviewThreadRecord, SourceContext, ThreadMessageRecord,
     export::{AgentContext, TrajectoryRecord},
 };
@@ -41,6 +41,24 @@ pub struct NewReviewSession {
     pub base_ref: String,
     /// Head ref.
     pub head_ref: String,
+    /// Branch this review targets. Defaults to `head_ref` when omitted.
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+/// Agent-session registration payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewAgentSession {
+    /// Harness-provided session id (Claude/Codex/etc.).
+    pub agent_session_id: String,
+    /// Agent name, e.g. "claude" or "codex".
+    pub agent_name: String,
+    /// Absolute repo path the agent is running in. Optional for non-git contexts.
+    #[serde(default)]
+    pub repo_path: Option<String>,
+    /// Current git branch at registration time. Optional for detached HEAD.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 /// Line-comment creation payload.
@@ -258,6 +276,7 @@ impl Database {
         tx.commit()?;
         ensure_source_context_columns(&conn)?;
         ensure_feedback_columns(&conn)?;
+        ensure_multi_branch_sessions(&mut conn)?;
         Ok(())
     }
 
@@ -342,15 +361,20 @@ impl Database {
         let tx = conn.transaction()?;
         let id = new_id();
         let timestamp = now();
+        let branch = input
+            .branch
+            .clone()
+            .or_else(|| Some(input.head_ref.clone()));
         tx.execute(
-            "insert into review_sessions(id, repo_id, title, base_ref, head_ref, base_sha, head_sha, status, created_at, updated_at)
-             values(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'open', ?8, ?8)",
+            "insert into review_sessions(id, repo_id, title, base_ref, head_ref, branch, base_sha, head_sha, status, created_at, updated_at)
+             values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'open', ?9, ?9)",
             params![
                 id,
                 input.repo_id,
                 input.title,
                 input.base_ref,
                 input.head_ref,
+                branch,
                 base_sha,
                 head_sha,
                 timestamp
@@ -436,11 +460,15 @@ impl Database {
                 "head_sha": head_sha
             }),
         )?;
+        let active_branch = branch.clone().unwrap_or_else(|| input.head_ref.clone());
         tx.execute(
-            "insert into active_review_sessions(repo_id, session_id, start_sha, updated_at)
-             values(?1, ?2, ?3, ?4)
-             on conflict(repo_id) do update set session_id = excluded.session_id, start_sha = excluded.start_sha, updated_at = excluded.updated_at",
-            params![repo.id, id, head_sha, timestamp],
+            "insert into active_review_sessions(repo_id, branch, session_id, start_sha, updated_at)
+             values(?1, ?2, ?3, ?4, ?5)
+             on conflict(repo_id, branch) do update set
+               session_id = excluded.session_id,
+               start_sha = excluded.start_sha,
+               updated_at = excluded.updated_at",
+            params![repo.id, active_branch, id, head_sha, timestamp],
         )?;
         tx.commit()?;
         self.review_session(&id)?
@@ -663,7 +691,7 @@ impl Database {
     pub fn review_session(&self, id: &str) -> Result<Option<ReviewSessionRecord>> {
         let conn = self.connect()?;
         conn.query_row(
-            "select id, repo_id, title, base_ref, head_ref, base_sha, head_sha, status, created_at, updated_at
+            "select id, repo_id, title, base_ref, head_ref, branch, base_sha, head_sha, status, created_at, updated_at
              from review_sessions where id = ?1",
             [id],
             map_review_session,
@@ -679,7 +707,7 @@ impl Database {
     pub fn review_sessions(&self) -> Result<Vec<ReviewSessionRecord>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "select id, repo_id, title, base_ref, head_ref, base_sha, head_sha, status, created_at, updated_at
+            "select id, repo_id, title, base_ref, head_ref, branch, base_sha, head_sha, status, created_at, updated_at
              from review_sessions order by created_at desc",
         )?;
         let rows = stmt.query_map([], map_review_session)?;
@@ -687,7 +715,11 @@ impl Database {
             .map_err(Into::into)
     }
 
-    /// Mark a review session as the active session for its repository.
+    /// Mark a review session as the active session for its (repo, branch) tuple.
+    ///
+    /// Branch is taken from `session.branch`, falling back to `session.head_ref`
+    /// when null. This means existing reviews that pre-date the multi-branch
+    /// migration continue to activate against their head ref as the key.
     ///
     /// # Errors
     /// Returns an error when SQLite fails or the session does not exist.
@@ -698,16 +730,24 @@ impl Database {
         let repo = self
             .repo(&session.repo_id)?
             .with_context(|| format!("repo not found: {}", session.repo_id))?;
+        let branch = session
+            .branch
+            .clone()
+            .unwrap_or_else(|| session.head_ref.clone());
         let timestamp = now();
         let conn = self.connect()?;
         conn.execute(
-            "insert into active_review_sessions(repo_id, session_id, start_sha, updated_at)
-             values(?1, ?2, ?3, ?4)
-             on conflict(repo_id) do update set session_id = excluded.session_id, start_sha = excluded.start_sha, updated_at = excluded.updated_at",
-            params![session.repo_id, session.id, session.head_sha, timestamp],
+            "insert into active_review_sessions(repo_id, branch, session_id, start_sha, updated_at)
+             values(?1, ?2, ?3, ?4, ?5)
+             on conflict(repo_id, branch) do update set
+               session_id = excluded.session_id,
+               start_sha = excluded.start_sha,
+               updated_at = excluded.updated_at",
+            params![session.repo_id, branch, session.id, session.head_sha, timestamp],
         )?;
         Ok(ActiveReviewSessionRecord {
             repo,
+            branch,
             session,
             start_sha: self
                 .review_session(session_id)?
@@ -719,52 +759,311 @@ impl Database {
 
     /// Resolve the active review session for a local repository path.
     ///
+    /// When `branch` is `Some`, returns the active review for that exact branch.
+    /// When `branch` is `None`, returns any active review for the repo (newest
+    /// updated_at wins). The `None` case exists to keep one-call callers working
+    /// when the branch is unknown; prefer passing `Some(branch)` when possible.
+    ///
     /// # Errors
     /// Returns an error when SQLite fails.
     pub fn active_review_session_for_repo_path(
         &self,
         path: impl Into<PathBuf>,
+        branch: Option<&str>,
     ) -> Result<Option<ActiveReviewSessionRecord>> {
         let path = path.into().canonicalize()?.display().to_string();
         let conn = self.connect()?;
-        conn.query_row(
-            "select
+        let row_to_record = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ActiveReviewSessionRecord> {
+            Ok(ActiveReviewSessionRecord {
+                repo: RepoRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                },
+                branch: row.get(17)?,
+                session: ReviewSessionRecord {
+                    id: row.get(5)?,
+                    repo_id: row.get(6)?,
+                    title: row.get(7)?,
+                    base_ref: row.get(8)?,
+                    head_ref: row.get(9)?,
+                    branch: row.get(10)?,
+                    base_sha: row.get(11)?,
+                    head_sha: row.get(12)?,
+                    status: row.get(13)?,
+                    created_at: row.get(14)?,
+                    updated_at: row.get(15)?,
+                },
+                start_sha: row.get(16)?,
+                updated_at: row.get(18)?,
+            })
+        };
+        let base_select = "select
                 r.id, r.name, r.path, r.created_at, r.updated_at,
-                rs.id, rs.repo_id, rs.title, rs.base_ref, rs.head_ref, rs.base_sha, rs.head_sha, rs.status, rs.created_at, rs.updated_at,
-                ars.start_sha, ars.updated_at
+                rs.id, rs.repo_id, rs.title, rs.base_ref, rs.head_ref, rs.branch, rs.base_sha, rs.head_sha, rs.status, rs.created_at, rs.updated_at,
+                ars.start_sha, ars.branch, ars.updated_at
              from repos r
              join active_review_sessions ars on ars.repo_id = r.id
-             join review_sessions rs on rs.id = ars.session_id
-             where r.path = ?1",
-            [path],
-            |row| {
-                Ok(ActiveReviewSessionRecord {
-                    repo: RepoRecord {
-                        id: row.get(0)?,
-                        name: row.get(1)?,
-                        path: row.get(2)?,
-                        created_at: row.get(3)?,
-                        updated_at: row.get(4)?,
-                    },
-                    session: ReviewSessionRecord {
-                        id: row.get(5)?,
-                        repo_id: row.get(6)?,
-                        title: row.get(7)?,
-                        base_ref: row.get(8)?,
-                        head_ref: row.get(9)?,
-                        base_sha: row.get(10)?,
-                        head_sha: row.get(11)?,
-                        status: row.get(12)?,
-                        created_at: row.get(13)?,
-                        updated_at: row.get(14)?,
-                    },
-                    start_sha: row.get(15)?,
-                    updated_at: row.get(16)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(Into::into)
+             join review_sessions rs on rs.id = ars.session_id";
+        match branch {
+            Some(branch) => conn
+                .query_row(
+                    &format!("{base_select} where r.path = ?1 and ars.branch = ?2"),
+                    params![path, branch],
+                    row_to_record,
+                )
+                .optional()
+                .map_err(Into::into),
+            None => conn
+                .query_row(
+                    &format!(
+                        "{base_select} where r.path = ?1 order by ars.updated_at desc limit 1"
+                    ),
+                    params![path],
+                    row_to_record,
+                )
+                .optional()
+                .map_err(Into::into),
+        }
+    }
+
+    /// Register an agent session, resolving its repo by path when available.
+    ///
+    /// Idempotent on `(agent_session_id, agent_name)`. If a row already exists,
+    /// `repo_id` and `branch` are refreshed and `last_activity_at` bumped, but
+    /// `started_at` is preserved. The linked review session is computed lazily
+    /// at lookup time, not stored on this row.
+    ///
+    /// # Errors
+    /// Returns an error when SQLite fails.
+    pub fn register_agent_session(&self, input: NewAgentSession) -> Result<AgentSessionRecord> {
+        let timestamp = now();
+        let repo_id = match input.repo_path.as_deref() {
+            Some(path) => self.repo_id_for_path(path)?,
+            None => None,
+        };
+        let conn = self.connect()?;
+        let existing: Option<String> = conn
+            .query_row(
+                "select id from agent_sessions
+                 where agent_session_id = ?1 and agent_name = ?2",
+                params![input.agent_session_id, input.agent_name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let id = match existing {
+            Some(id) => {
+                conn.execute(
+                    "update agent_sessions
+                     set repo_id = ?1, branch = ?2, last_activity_at = ?3, ended_at = null
+                     where id = ?4",
+                    params![repo_id, input.branch, timestamp, id],
+                )?;
+                id
+            }
+            None => {
+                let id = new_id();
+                conn.execute(
+                    "insert into agent_sessions
+                       (id, agent_session_id, agent_name, repo_id, branch, started_at, last_activity_at)
+                     values(?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                    params![
+                        id,
+                        input.agent_session_id,
+                        input.agent_name,
+                        repo_id,
+                        input.branch,
+                        timestamp
+                    ],
+                )?;
+                id
+            }
+        };
+        self.agent_session(&id)?
+            .context("agent session was not persisted")
+    }
+
+    /// Bump an agent session's activity timestamp. No-op if it does not exist.
+    ///
+    /// # Errors
+    /// Returns an error when SQLite fails.
+    pub fn bump_agent_session_activity(
+        &self,
+        agent_session_id: &str,
+        agent_name: &str,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "update agent_sessions set last_activity_at = ?1
+             where agent_session_id = ?2 and agent_name = ?3",
+            params![now(), agent_session_id, agent_name],
+        )?;
+        Ok(())
+    }
+
+    /// Mark an agent session ended.
+    ///
+    /// # Errors
+    /// Returns an error when SQLite fails.
+    pub fn end_agent_session(&self, agent_session_id: &str, agent_name: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let timestamp = now();
+        conn.execute(
+            "update agent_sessions
+             set ended_at = ?1, last_activity_at = ?1
+             where agent_session_id = ?2 and agent_name = ?3",
+            params![timestamp, agent_session_id, agent_name],
+        )?;
+        Ok(())
+    }
+
+    /// Fetch one agent session by internal row id.
+    ///
+    /// # Errors
+    /// Returns an error when SQLite fails.
+    pub fn agent_session(&self, id: &str) -> Result<Option<AgentSessionRecord>> {
+        let conn = self.connect()?;
+        let row = conn
+            .query_row(
+                "select id, agent_session_id, agent_name, repo_id, branch,
+                        started_at, last_activity_at, ended_at
+                 from agent_sessions where id = ?1",
+                [id],
+                map_agent_session,
+            )
+            .optional()?;
+        match row {
+            Some(record) => Ok(Some(self.attach_review_link(record)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch an agent session by the harness-provided id + agent name.
+    ///
+    /// # Errors
+    /// Returns an error when SQLite fails.
+    pub fn agent_session_by_external_id(
+        &self,
+        agent_session_id: &str,
+        agent_name: &str,
+    ) -> Result<Option<AgentSessionRecord>> {
+        let conn = self.connect()?;
+        let row = conn
+            .query_row(
+                "select id, agent_session_id, agent_name, repo_id, branch,
+                        started_at, last_activity_at, ended_at
+                 from agent_sessions
+                 where agent_session_id = ?1 and agent_name = ?2",
+                params![agent_session_id, agent_name],
+                map_agent_session,
+            )
+            .optional()?;
+        match row {
+            Some(record) => Ok(Some(self.attach_review_link(record)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List agent sessions linked to a review session (active in the
+    /// last `idle_cutoff_seconds`). Pass `i64::MAX` to include everything.
+    ///
+    /// # Errors
+    /// Returns an error when SQLite fails.
+    pub fn agent_sessions_for_review(
+        &self,
+        session_id: &str,
+        idle_cutoff_seconds: i64,
+    ) -> Result<Vec<AgentSessionRecord>> {
+        let session = self
+            .review_session(session_id)?
+            .with_context(|| format!("review session not found: {session_id}"))?;
+        let branch = session
+            .branch
+            .clone()
+            .unwrap_or_else(|| session.head_ref.clone());
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "select id, agent_session_id, agent_name, repo_id, branch,
+                    started_at, last_activity_at, ended_at
+             from agent_sessions
+             where repo_id = ?1 and branch = ?2
+             order by last_activity_at desc",
+        )?;
+        let rows = stmt.query_map(params![session.repo_id, branch], map_agent_session)?;
+        let mut out = Vec::new();
+        let cutoff = if idle_cutoff_seconds == i64::MAX {
+            None
+        } else {
+            Some(
+                Utc::now()
+                    - chrono::Duration::try_seconds(idle_cutoff_seconds)
+                        .unwrap_or_else(chrono::Duration::zero),
+            )
+        };
+        for row in rows {
+            let mut record = row?;
+            if let Some(cutoff_dt) = cutoff
+                && let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&record.last_activity_at)
+                && parsed.with_timezone(&Utc) < cutoff_dt
+            {
+                continue;
+            }
+            record.review_session_id = Some(session_id.to_string());
+            out.push(record);
+        }
+        Ok(out)
+    }
+
+    /// Resolve the linked review session id for an agent session, by looking up
+    /// the active review for that agent's `(repo, branch)` at call time.
+    ///
+    /// # Errors
+    /// Returns an error when SQLite fails.
+    pub fn linked_review_session_for_agent(
+        &self,
+        agent_session_id: &str,
+        agent_name: &str,
+    ) -> Result<Option<String>> {
+        let record = match self.agent_session_by_external_id(agent_session_id, agent_name)? {
+            Some(record) => record,
+            None => return Ok(None),
+        };
+        Ok(record.review_session_id)
+    }
+
+    fn attach_review_link(&self, mut record: AgentSessionRecord) -> Result<AgentSessionRecord> {
+        if let (Some(repo_id), Some(branch)) = (record.repo_id.as_deref(), record.branch.as_deref())
+        {
+            let conn = self.connect()?;
+            let id: Option<String> = conn
+                .query_row(
+                    "select session_id from active_review_sessions
+                     where repo_id = ?1 and branch = ?2",
+                    params![repo_id, branch],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            record.review_session_id = id;
+        }
+        Ok(record)
+    }
+
+    fn repo_id_for_path(&self, path: &str) -> Result<Option<String>> {
+        let canonical = match PathBuf::from(path).canonicalize() {
+            Ok(p) => p.display().to_string(),
+            Err(_) => return Ok(None),
+        };
+        let conn = self.connect()?;
+        let id: Option<String> = conn
+            .query_row(
+                "select id from repos where path = ?1",
+                [canonical],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(id)
     }
 
     /// Fetch diff files, hunks, and lines for a review session.
@@ -1520,6 +1819,93 @@ fn ensure_feedback_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_multi_branch_sessions(conn: &mut Connection) -> Result<()> {
+    ensure_column(conn, "review_sessions", "branch", "text")?;
+    let needs_rebuild = active_review_sessions_needs_rebuild(conn)?;
+    if needs_rebuild {
+        rebuild_active_review_sessions(conn)?;
+    }
+    conn.execute(
+        "create table if not exists agent_sessions (
+          id text primary key,
+          agent_session_id text not null,
+          agent_name text not null,
+          repo_id text references repos(id),
+          branch text,
+          started_at text not null,
+          last_activity_at text not null,
+          ended_at text,
+          unique (agent_session_id, agent_name)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "create index if not exists idx_agent_sessions_repo_branch
+         on agent_sessions(repo_id, branch)",
+        [],
+    )?;
+    conn.execute(
+        "insert or ignore into schema_migrations(version, applied_at) values(4, ?1)",
+        [now()],
+    )?;
+    Ok(())
+}
+
+fn active_review_sessions_needs_rebuild(conn: &Connection) -> Result<bool> {
+    let mut stmt = conn.prepare("pragma table_info(active_review_sessions)")?;
+    let mut has_branch = false;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "branch" {
+            has_branch = true;
+            break;
+        }
+    }
+    Ok(!has_branch)
+}
+
+fn rebuild_active_review_sessions(conn: &mut Connection) -> Result<()> {
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "create table active_review_sessions_new (
+          repo_id text not null references repos(id),
+          branch text not null,
+          session_id text not null references review_sessions(id),
+          start_sha text not null,
+          updated_at text not null,
+          primary key (repo_id, branch)
+        )",
+        [],
+    )?;
+    tx.execute(
+        "insert into active_review_sessions_new (repo_id, branch, session_id, start_sha, updated_at)
+         select ars.repo_id,
+                coalesce(rs.branch, rs.head_ref, '__legacy__'),
+                ars.session_id,
+                ars.start_sha,
+                ars.updated_at
+         from active_review_sessions ars
+         left join review_sessions rs on rs.id = ars.session_id",
+        [],
+    )?;
+    tx.execute("drop table active_review_sessions", [])?;
+    tx.execute(
+        "alter table active_review_sessions_new rename to active_review_sessions",
+        [],
+    )?;
+    tx.execute(
+        "update review_sessions
+         set branch = coalesce(branch, head_ref)
+         where branch is null",
+        [],
+    )?;
+    tx.commit()?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(())
+}
+
 fn ensure_column(
     conn: &Connection,
     table: &'static str,
@@ -1539,6 +1925,20 @@ fn ensure_column(
     Ok(())
 }
 
+fn map_agent_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSessionRecord> {
+    Ok(AgentSessionRecord {
+        id: row.get(0)?,
+        agent_session_id: row.get(1)?,
+        agent_name: row.get(2)?,
+        repo_id: row.get(3)?,
+        branch: row.get(4)?,
+        review_session_id: None,
+        started_at: row.get(5)?,
+        last_activity_at: row.get(6)?,
+        ended_at: row.get(7)?,
+    })
+}
+
 fn map_repo(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoRecord> {
     Ok(RepoRecord {
         id: row.get(0)?,
@@ -1556,11 +1956,12 @@ fn map_review_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewSession
         title: row.get(2)?,
         base_ref: row.get(3)?,
         head_ref: row.get(4)?,
-        base_sha: row.get(5)?,
-        head_sha: row.get(6)?,
-        status: row.get(7)?,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
+        branch: row.get(5)?,
+        base_sha: row.get(6)?,
+        head_sha: row.get(7)?,
+        status: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }
 
@@ -1921,6 +2322,7 @@ mod tests {
             title: "feature review".to_string(),
             base_ref: "master".to_string(),
             head_ref: "feature".to_string(),
+            branch: Some("feature".to_string()),
         })?;
         db.add_comment(NewComment {
             session_id: session.id.clone(),
@@ -2007,6 +2409,95 @@ mod tests {
             Some("a.txt")
         );
         assert_eq!(context.accepted_decisions.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn agent_session_registration_links_to_active_review() -> Result<()> {
+        let temp = tempdir()?;
+        let repo_dir = temp.path().join("repo");
+        std::fs::create_dir(&repo_dir)?;
+        run(&repo_dir, ["git", "init"])?;
+        run(
+            &repo_dir,
+            ["git", "config", "user.email", "test@example.com"],
+        )?;
+        run(&repo_dir, ["git", "config", "user.name", "Test User"])?;
+        std::fs::write(repo_dir.join("a.txt"), "one\n")?;
+        run(&repo_dir, ["git", "add", "."])?;
+        run(&repo_dir, ["git", "commit", "-m", "base"])?;
+        run(&repo_dir, ["git", "checkout", "-b", "feature"])?;
+        std::fs::write(repo_dir.join("a.txt"), "one\ntwo\n")?;
+        run(&repo_dir, ["git", "commit", "-am", "change"])?;
+
+        let db = Database::new(temp.path().join("diff.db"));
+        db.migrate()?;
+        let repo = db.upsert_repo(NewRepo {
+            name: "fixture".to_string(),
+            path: repo_dir.display().to_string(),
+        })?;
+        let session = db.create_review_session(NewReviewSession {
+            repo_id: repo.id.clone(),
+            title: "feature review".to_string(),
+            base_ref: "master".to_string(),
+            head_ref: "feature".to_string(),
+            branch: Some("feature".to_string()),
+        })?;
+
+        let agent = db.register_agent_session(NewAgentSession {
+            agent_session_id: "claude-abc".to_string(),
+            agent_name: "claude".to_string(),
+            repo_path: Some(repo_dir.display().to_string()),
+            branch: Some("feature".to_string()),
+        })?;
+        assert_eq!(agent.review_session_id.as_deref(), Some(session.id.as_str()));
+        assert_eq!(agent.repo_id.as_deref(), Some(repo.id.as_str()));
+
+        // Idempotent: re-register same id keeps row id stable.
+        let again = db.register_agent_session(NewAgentSession {
+            agent_session_id: "claude-abc".to_string(),
+            agent_name: "claude".to_string(),
+            repo_path: Some(repo_dir.display().to_string()),
+            branch: Some("feature".to_string()),
+        })?;
+        assert_eq!(again.id, agent.id);
+
+        // Lookup by external id resolves the linked review session.
+        let linked = db.linked_review_session_for_agent("claude-abc", "claude")?;
+        assert_eq!(linked.as_deref(), Some(session.id.as_str()));
+
+        // Agent session registered on a branch with no active review returns
+        // None for the linked id, but the row still exists.
+        let other = db.register_agent_session(NewAgentSession {
+            agent_session_id: "codex-xyz".to_string(),
+            agent_name: "codex".to_string(),
+            repo_path: Some(repo_dir.display().to_string()),
+            branch: Some("other-branch".to_string()),
+        })?;
+        assert!(other.review_session_id.is_none());
+
+        // Multiple agents on the same branch both surface in the list.
+        let _other_on_feature = db.register_agent_session(NewAgentSession {
+            agent_session_id: "codex-2".to_string(),
+            agent_name: "codex".to_string(),
+            repo_path: Some(repo_dir.display().to_string()),
+            branch: Some("feature".to_string()),
+        })?;
+        let active = db.agent_sessions_for_review(&session.id, i64::MAX)?;
+        assert_eq!(active.len(), 2);
+
+        // Branch-aware active session lookup.
+        let resolved = db
+            .active_review_session_for_repo_path(repo_dir.display().to_string(), Some("feature"))?
+            .expect("active session for feature");
+        assert_eq!(resolved.session.id, session.id);
+        assert_eq!(resolved.branch, "feature");
+
+        // Wrong branch returns None.
+        let missing = db
+            .active_review_session_for_repo_path(repo_dir.display().to_string(), Some("nope"))?;
+        assert!(missing.is_none());
+
         Ok(())
     }
 

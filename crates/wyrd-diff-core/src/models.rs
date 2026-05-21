@@ -30,6 +30,9 @@ pub struct ReviewSessionRecord {
     pub base_ref: String,
     /// Head ref.
     pub head_ref: String,
+    /// Branch this review targets. Used as the join key for agent sessions.
+    /// Defaults to `head_ref` when not set explicitly.
+    pub branch: Option<String>,
     /// Resolved base sha.
     pub base_sha: String,
     /// Resolved head sha.
@@ -42,17 +45,42 @@ pub struct ReviewSessionRecord {
     pub updated_at: String,
 }
 
-/// Active review session selected for a repository.
+/// Active review session selected for a repository + branch tuple.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveReviewSessionRecord {
     /// Repository record.
     pub repo: RepoRecord,
+    /// Branch this active session covers.
+    pub branch: String,
     /// Active review session.
     pub session: ReviewSessionRecord,
     /// Baseline sha used by agent recording hooks.
     pub start_sha: String,
     /// Last activation timestamp.
     pub updated_at: String,
+}
+
+/// Live or recently active coding-agent session attached to a repo + branch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSessionRecord {
+    /// Stable database id.
+    pub id: String,
+    /// Harness-provided session id (Claude/Codex/etc.). May repeat across agents.
+    pub agent_session_id: String,
+    /// Agent name, e.g. "claude" or "codex".
+    pub agent_name: String,
+    /// Repo this agent is attached to. Null when registered outside a known repo.
+    pub repo_id: Option<String>,
+    /// Branch at registration time. Null on detached HEAD or non-git contexts.
+    pub branch: Option<String>,
+    /// Linked review session id resolved by (repo, branch) at lookup time.
+    pub review_session_id: Option<String>,
+    /// Registration timestamp.
+    pub started_at: String,
+    /// Last hook ping timestamp.
+    pub last_activity_at: String,
+    /// Explicit end timestamp, when known.
+    pub ended_at: Option<String>,
 }
 
 /// Commit captured in a review session.
