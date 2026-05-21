@@ -1,5 +1,50 @@
-const apiBase = 'http://127.0.0.1:8765';
+const DEFAULT_HOST = '127.0.0.1';
+const BASE_PORT = 8765;
+const PORT_WINDOW = 10;
+const STORAGE_KEY = 'wyrd-diff/api-base';
 const token = 'dev-local-token';
+
+let apiBase = `http://${DEFAULT_HOST}:${BASE_PORT}`;
+let discovery: Promise<string> | null = null;
+
+async function probe(base: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${base}/health`, { method: 'GET' });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function discoverApiBase(): Promise<string> {
+  if (typeof window === 'undefined') return apiBase;
+  const cached = window.localStorage.getItem(STORAGE_KEY);
+  if (cached && (await probe(cached))) {
+    apiBase = cached;
+    return apiBase;
+  }
+  for (let offset = 0; offset < PORT_WINDOW; offset += 1) {
+    const candidate = `http://${DEFAULT_HOST}:${BASE_PORT + offset}`;
+    if (await probe(candidate)) {
+      apiBase = candidate;
+      window.localStorage.setItem(STORAGE_KEY, candidate);
+      return apiBase;
+    }
+  }
+  throw new Error(
+    `Wyrd Diff bridge unreachable on ${DEFAULT_HOST}:${BASE_PORT}..${BASE_PORT + PORT_WINDOW - 1}. Is the app running?`
+  );
+}
+
+export function ensureApiBase(): Promise<string> {
+  if (!discovery) discovery = discoverApiBase();
+  return discovery;
+}
+
+export function resetApiBaseDiscovery(): void {
+  discovery = null;
+  if (typeof window !== 'undefined') window.localStorage.removeItem(STORAGE_KEY);
+}
 
 export type ReviewSession = {
   id: string;
@@ -177,7 +222,8 @@ type RequestOptions = {
 };
 
 export async function api<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const response = await fetch(`${apiBase}${path}`, {
+  const base = await ensureApiBase();
+  const response = await fetch(`${base}${path}`, {
     method: options.method ?? 'GET',
     headers: {
       authorization: `Bearer ${token}`,
@@ -190,5 +236,45 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
   }
   return response.json() as Promise<T>;
 }
+
+export type AgentConfigResult = {
+  id: string;
+  display: string;
+  path: string;
+  action: 'created' | 'updated' | 'unchanged';
+};
+
+export type ConfigureAgentsResponse = {
+  url: string;
+  results: AgentConfigResult[];
+};
+
+export type ConfigureAgentResponse = {
+  url: string;
+  result: AgentConfigResult;
+};
+
+export type BridgeStatus = {
+  ok: boolean;
+  mcp_url: string;
+  version: string;
+};
+
+export type AgentConfigState = 'ok' | 'mismatch' | 'missing' | 'no_file';
+
+export type AgentStatusEntry = {
+  id: string;
+  display: string;
+  path: string;
+  detected: boolean;
+  state: AgentConfigState;
+  configured_url: string | null;
+  snippet: string;
+};
+
+export type AgentStatusResponse = {
+  mcp_url: string;
+  agents: AgentStatusEntry[];
+};
 
 export { apiBase, token };

@@ -82,7 +82,11 @@ impl GitRepo {
     /// # Errors
     /// Returns an error when git cannot resolve the ref.
     pub fn resolve_ref(&self, reference: &str) -> Result<String> {
-        let target = if reference == "WORKTREE" { "HEAD" } else { reference };
+        let target = if reference == "WORKTREE" {
+            "HEAD"
+        } else {
+            reference
+        };
         Ok(self.git(["rev-parse", target])?.trim().to_string())
     }
 
@@ -411,7 +415,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn run(cwd: &std::path::Path, args: &[&str]) {
-        let status = Command::new("git").args(args).current_dir(cwd).status().unwrap();
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .unwrap();
         assert!(status.success(), "git {args:?} failed");
     }
 

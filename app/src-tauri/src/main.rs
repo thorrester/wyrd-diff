@@ -34,8 +34,29 @@ async fn run_local_bridge(app: &tauri::AppHandle) -> anyhow::Result<()> {
     let token = env::var("WYRD_DIFF_TOKEN").unwrap_or_else(|_| "dev-local-token".to_string());
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
 
-    println!("wyrd-diff local bridge listening on http://{addr}");
-    wyrd_diff_api::serve(db, token, addr).await
+    let (listener, bound) = wyrd_diff_api::bind_with_fallback(addr, 10).await?;
+    let mcp_url = wyrd_diff_api::mcp_url_for(bound);
+    write_runtime_marker(app, &bound, &mcp_url);
+    println!("wyrd-diff local bridge listening on http://{bound}");
+    println!("wyrd-diff MCP available at {mcp_url}");
+    wyrd_diff_api::serve_on(db, token, listener, mcp_url).await
+}
+
+fn write_runtime_marker(app: &tauri::AppHandle, addr: &SocketAddr, mcp_url: &str) {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| PathBuf::from(".data"));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("runtime.json");
+    let body = serde_json::json!({
+        "api_base": format!("http://{addr}"),
+        "mcp_url": mcp_url,
+        "port": addr.port(),
+    });
+    let _ = std::fs::write(path, format!("{body:#}\n"));
 }
 
 fn database_path(app: &tauri::AppHandle) -> PathBuf {

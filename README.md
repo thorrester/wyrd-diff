@@ -26,6 +26,18 @@ mise run dev:api
 mise run dev:mcp
 ```
 
+## Agent Setup (one-time)
+
+The Tauri app auto-starts the local bridge on `http://127.0.0.1:8765` which
+exposes the MCP HTTP transport at `/mcp`. After `mise run dev` is running:
+
+- Click **Configure Claude + Codex** on the home screen, **or**
+- Run `mise run configure:agents`
+
+Both write `~/.claude.json` (`mcpServers.wyrd-diff`) and `~/.codex/config.toml`
+(`[mcp_servers.wyrd-diff]`). Other MCP entries are left untouched. Restart your
+agent client to pick up the new server.
+
 ## First Workflow
 
 1. Register a local git repository.

@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agent_config;
 pub mod db;
 pub mod export;
 pub mod git;

@@ -22,6 +22,7 @@ use wyrd_diff_core::{
 pub struct ApiState {
     db: Database,
     token: String,
+    mcp_url: String,
 }
 
 /// API error response.
@@ -45,11 +46,64 @@ pub type ApiResult<T> = Result<T, ApiError>;
 /// # Errors
 /// Returns an error when the listener cannot bind or the server fails.
 pub async fn serve(db: Database, token: String, addr: SocketAddr) -> anyhow::Result<()> {
-    let state = Arc::new(ApiState { db, token });
-    let app = router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
+    serve_on(db, token, listener, mcp_url_for(bound)).await
+}
+
+/// Bind on `addr`. If the port is taken, walk forward up to `max_attempts - 1`
+/// extra ports before giving up. Returns the bound listener and the actual
+/// address used.
+///
+/// # Errors
+/// Returns an error when every port in the window is in use, or the OS
+/// rejects the bind for a reason other than `AddrInUse`.
+pub async fn bind_with_fallback(
+    addr: SocketAddr,
+    max_attempts: u16,
+) -> anyhow::Result<(tokio::net::TcpListener, SocketAddr)> {
+    let base = addr.port();
+    let mut last_err = None;
+    for offset in 0..max_attempts {
+        let port = base.saturating_add(offset);
+        let candidate = SocketAddr::new(addr.ip(), port);
+        match tokio::net::TcpListener::bind(candidate).await {
+            Ok(listener) => return Ok((listener, candidate)),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+                last_err = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "no free port in window {base}..{} ({})",
+        base + max_attempts,
+        last_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    ))
+}
+
+/// Serve the local API on a pre-bound listener with an explicit MCP URL.
+///
+/// # Errors
+/// Returns an error when the server task fails.
+pub async fn serve_on(
+    db: Database,
+    token: String,
+    listener: tokio::net::TcpListener,
+    mcp_url: String,
+) -> anyhow::Result<()> {
+    let state = Arc::new(ApiState { db, token, mcp_url });
+    let app = router(state);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Build the canonical MCP URL for a bound socket.
+pub fn mcp_url_for(addr: SocketAddr) -> String {
+    format!("http://{addr}/mcp")
 }
 
 /// Build an API router.
@@ -63,7 +117,10 @@ pub fn router(state: Arc<ApiState>) -> Router {
         )
         .route("/api/review-sessions/:id", get(review_session))
         .route("/api/review-sessions/:id/diff", get(review_diff))
-        .route("/api/review-sessions/:id/refresh", post(refresh_review_session))
+        .route(
+            "/api/review-sessions/:id/refresh",
+            post(refresh_review_session),
+        )
         .route(
             "/api/review-sessions/:id/threads",
             get(review_threads).post(add_review_thread),
@@ -85,8 +142,125 @@ pub fn router(state: Arc<ApiState>) -> Router {
         )
         .route("/api/review-sessions/:id/agent-context", get(agent_context))
         .route("/api/export/trajectory.jsonl", get(export_trajectory))
+        .route("/mcp", post(mcp_endpoint).get(mcp_get))
+        .route("/api/configure-agents", post(configure_agents_endpoint))
+        .route("/api/configure-agents/:id", post(configure_agent_endpoint))
+        .route("/api/status", get(status))
+        .route("/api/agent-status", get(agent_status_endpoint))
         .with_state(state)
         .layer(CorsLayer::permissive())
+}
+
+async fn status(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "ok": true,
+        "mcp_url": state.mcp_url,
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+async fn agent_status_endpoint(
+    State(state): State<Arc<ApiState>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let statuses =
+        wyrd_diff_core::agent_config::agent_status(&state.mcp_url).map_err(|e| ApiError {
+            code: "agent_status_failed".to_string(),
+            message: format!("{e:#}"),
+        })?;
+    let results: Vec<serde_json::Value> = statuses
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "display": s.display,
+                "path": s.path.display().to_string(),
+                "detected": s.detected,
+                "state": match s.state {
+                    wyrd_diff_core::agent_config::AgentConfigState::Ok => "ok",
+                    wyrd_diff_core::agent_config::AgentConfigState::Mismatch => "mismatch",
+                    wyrd_diff_core::agent_config::AgentConfigState::Missing => "missing",
+                    wyrd_diff_core::agent_config::AgentConfigState::NoFile => "no_file",
+                },
+                "configured_url": s.configured_url,
+                "snippet": s.snippet,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "mcp_url": state.mcp_url,
+        "agents": results,
+    })))
+}
+
+async fn configure_agents_endpoint(
+    State(state): State<Arc<ApiState>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let url = state.mcp_url.clone();
+    let writes = wyrd_diff_core::agent_config::configure_agents(&url).map_err(|e| ApiError {
+        code: "configure_agents_failed".to_string(),
+        message: format!("{e:#}"),
+    })?;
+    let results: Vec<serde_json::Value> = writes
+        .into_iter()
+        .map(|w| {
+            serde_json::json!({
+                "id": w.id,
+                "display": w.display,
+                "path": w.path.display().to_string(),
+                "action": match w.action {
+                    wyrd_diff_core::agent_config::ConfigAction::Created => "created",
+                    wyrd_diff_core::agent_config::ConfigAction::Updated => "updated",
+                    wyrd_diff_core::agent_config::ConfigAction::Unchanged => "unchanged",
+                }
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "url": url, "results": results })))
+}
+
+async fn configure_agent_endpoint(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let url = state.mcp_url.clone();
+    let write = wyrd_diff_core::agent_config::configure_agent(&id, &url).map_err(|e| ApiError {
+        code: "configure_agent_failed".to_string(),
+        message: format!("{e:#}"),
+    })?;
+    Ok(Json(serde_json::json!({
+        "url": url,
+        "result": {
+            "id": write.id,
+            "display": write.display,
+            "path": write.path.display().to_string(),
+            "action": match write.action {
+                wyrd_diff_core::agent_config::ConfigAction::Created => "created",
+                wyrd_diff_core::agent_config::ConfigAction::Updated => "updated",
+                wyrd_diff_core::agent_config::ConfigAction::Unchanged => "unchanged",
+            },
+        }
+    })))
+}
+
+async fn mcp_endpoint(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    let db = state.db.clone();
+    let result = tokio::task::spawn_blocking(move || wyrd_diff_mcp::dispatch(&db, request)).await;
+    match result {
+        Ok(Some(response)) => Json(response).into_response(),
+        Ok(None) => StatusCode::ACCEPTED.into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn mcp_get() -> Response {
+    (StatusCode::METHOD_NOT_ALLOWED, "MCP requires POST").into_response()
 }
 
 async fn health() -> Json<serde_json::Value> {

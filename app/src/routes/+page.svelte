@@ -64,7 +64,10 @@
       <p class="eyebrow">local review memory</p>
       <h1>Wyrd Diff</h1>
     </div>
-    <p>Review diffs, record thinking, expose agent-ready context, and preserve code trajectory.</p>
+    <div class="hero-side">
+      <p>Review diffs, record thinking, expose agent-ready context, and preserve code trajectory.</p>
+      <p class="hero-hint">Bridge + agent wiring live in the status pill (bottom-right).</p>
+    </div>
   </section>
 
   <div class="workspace">
@@ -160,6 +163,19 @@
     padding: 22px 0 26px;
     border-bottom: 1px solid var(--wm-border-strong);
     box-shadow: 0 1px 0 rgba(124, 255, 158, 0.12);
+  }
+
+  .hero-side {
+    display: grid;
+    gap: 12px;
+  }
+
+  .hero-hint {
+    margin: 0;
+    color: var(--wm-muted);
+    font: 11px/1.4 var(--wm-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
   }
 
   h1,

@@ -26,8 +26,12 @@ description = "Run the local API server"
 run = "cargo run --locked -p wyrd-diff-cli -- serve"
 
 [tasks."dev:mcp"]
-description = "Run the Wyrd Diff MCP server over stdio"
+description = "Run the Wyrd Diff MCP server over stdio (HTTP transport is auto-wired by dev)"
 run = "cargo run --locked -p wyrd-diff-mcp"
+
+[tasks."configure:agents"]
+description = "Auto-wire Claude Code + Codex to the local MCP HTTP endpoint"
+run = "cargo run --locked -p wyrd-diff-cli -- configure-agents"
 
 [tasks."dev:ui"]
 description = "Run the SvelteKit development server"

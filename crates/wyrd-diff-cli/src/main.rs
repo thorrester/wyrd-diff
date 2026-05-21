@@ -10,7 +10,10 @@ use std::{
     path::PathBuf,
     process::Command,
 };
-use wyrd_diff_core::{Database, NewFixImport, NewRepo, NewReviewSession};
+use wyrd_diff_core::{
+    Database, NewFixImport, NewRepo, NewReviewSession,
+    agent_config::{ConfigAction, DEFAULT_MCP_URL, configure_agents},
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -119,6 +122,28 @@ async fn main() -> Result<()> {
             }
             _ => bail!("usage: wyrd-diff-cli export trajectory [repo_id]"),
         },
+        "configure-agents" => {
+            let url = args.next().unwrap_or_else(|| DEFAULT_MCP_URL.to_string());
+            let writes = configure_agents(&url)?;
+            if writes.is_empty() {
+                println!("no detected agent harnesses (claude, codex, opencode, gemini)");
+            }
+            for write in &writes {
+                let label = match write.action {
+                    ConfigAction::Created => "created",
+                    ConfigAction::Updated => "updated",
+                    ConfigAction::Unchanged => "unchanged",
+                };
+                println!(
+                    "{} ({}): {} [{label}]",
+                    write.display,
+                    write.id,
+                    write.path.display()
+                );
+            }
+            println!("MCP url: {url}");
+            Ok(())
+        }
         "serve" => {
             db.migrate()?;
             let host = env::var("WYRD_DIFF_API_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -128,9 +153,12 @@ async fn main() -> Result<()> {
             let token =
                 env::var("WYRD_DIFF_TOKEN").unwrap_or_else(|_| "dev-local-token".to_string());
             let addr: SocketAddr = format!("{host}:{port}").parse()?;
-            println!("wyrd-diff API listening on http://{addr}");
+            let (listener, bound) = wyrd_diff_api::bind_with_fallback(addr, 10).await?;
+            let mcp_url = wyrd_diff_api::mcp_url_for(bound);
+            println!("wyrd-diff API listening on http://{bound}");
+            println!("wyrd-diff MCP at {mcp_url}");
             println!("authorization: Bearer {token}");
-            wyrd_diff_api::serve(db, token, addr).await
+            wyrd_diff_api::serve_on(db, token, listener, mcp_url).await
         }
         other => bail!("unknown command: {other}"),
     }
@@ -254,6 +282,7 @@ Commands:
   review record-fix <session_id> <commit_sha> [response_file|-] [tests_json_file]
   hook agent-stop
   export trajectory [repo_id]
+  configure-agents [mcp_url]
   serve
 "
     );
