@@ -2,7 +2,6 @@
 #![forbid(unsafe_code)]
 
 use std::{env, net::SocketAddr, path::PathBuf};
-use tauri::Manager;
 use wyrd_diff_core::Database;
 
 fn main() {
@@ -23,8 +22,8 @@ fn start_local_bridge(app: tauri::AppHandle) {
     });
 }
 
-async fn run_local_bridge(app: &tauri::AppHandle) -> anyhow::Result<()> {
-    let db = Database::new(database_path(app));
+async fn run_local_bridge(_app: &tauri::AppHandle) -> anyhow::Result<()> {
+    let db = Database::new(database_path());
     db.migrate()?;
 
     let host = env::var("WYRD_DIFF_API_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -36,17 +35,25 @@ async fn run_local_bridge(app: &tauri::AppHandle) -> anyhow::Result<()> {
 
     let (listener, bound) = wyrd_diff_api::bind_with_fallback(addr, 10).await?;
     let mcp_url = wyrd_diff_api::mcp_url_for(bound);
-    write_runtime_marker(app, &bound, &mcp_url);
+    write_runtime_marker(&bound, &mcp_url);
     println!("wyrd-diff local bridge listening on http://{bound}");
     println!("wyrd-diff MCP available at {mcp_url}");
     wyrd_diff_api::serve_on(db, token, listener, mcp_url).await
 }
 
-fn write_runtime_marker(app: &tauri::AppHandle, addr: &SocketAddr, mcp_url: &str) {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .unwrap_or_else(|_| PathBuf::from(".data"));
+fn config_dir() -> PathBuf {
+    if let Ok(override_dir) = env::var("WYRD_DIFF_CONFIG_DIR") {
+        return PathBuf::from(override_dir);
+    }
+    let home = env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    home.join(".config").join("wyrd-diff")
+}
+
+fn write_runtime_marker(addr: &SocketAddr, mcp_url: &str) {
+    let dir = config_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -59,15 +66,11 @@ fn write_runtime_marker(app: &tauri::AppHandle, addr: &SocketAddr, mcp_url: &str
     let _ = std::fs::write(path, format!("{body:#}\n"));
 }
 
-fn database_path(app: &tauri::AppHandle) -> PathBuf {
+fn database_path() -> PathBuf {
     if let Ok(url) = env::var("DATABASE_URL")
         && let Some(path) = url.strip_prefix("sqlite://")
     {
         return PathBuf::from(path);
     }
-
-    app.path()
-        .app_data_dir()
-        .unwrap_or_else(|_| PathBuf::from(".data"))
-        .join("wyrd-diff.db")
+    config_dir().join("wyrd-diff.db")
 }
