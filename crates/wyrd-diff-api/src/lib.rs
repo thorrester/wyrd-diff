@@ -280,7 +280,11 @@ async fn mcp_endpoint(
     let result = tokio::task::spawn_blocking(move || wyrd_diff_mcp::dispatch(&db, request)).await;
     match result {
         Ok(Some(response)) => Json(response).into_response(),
-        Ok(None) => StatusCode::ACCEPTED.into_response(),
+        // JSON-RPC notifications have no response, but Codex's bundled
+        // rmcp 0.15 client unconditionally `serde_json::from_slice`s the
+        // response body and chokes on an empty 202. Return 200 OK with an
+        // empty JSON object so the handshake completes.
+        Ok(None) => Json(serde_json::json!({})).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": error.to_string() })),
