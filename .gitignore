@@ -9,4 +9,4 @@
 *.log
 .DS_Store
 .playwright-mcp/
-node_modules/.cache/@babel/register/.babel.7.5.5.development.json
+node_modules/
