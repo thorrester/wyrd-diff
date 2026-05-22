@@ -270,7 +270,8 @@ export class ApiTimeoutError extends Error {
 }
 
 function linkSignals(external: AbortSignal | undefined, timeoutMs: number | undefined) {
-  if (!external && !timeoutMs) return { signal: undefined as AbortSignal | undefined, cleanup: () => {} };
+  if (!external && !timeoutMs)
+    return { signal: undefined as AbortSignal | undefined, cleanup: () => {} };
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const onExternalAbort = () => controller.abort(external?.reason);

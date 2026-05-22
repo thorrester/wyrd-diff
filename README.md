@@ -31,6 +31,27 @@ It also keeps the byproducts. Notes, decisions, and accepted fix trajectory get 
 
 Target repo stays clean. No `.wyrd/` directory. No commits to scrub before pushing.
 
+## Screenshots
+
+<p>
+  <img
+    src="fixtures/homepage.png"
+    alt="Wyrd Diff home view with the review-session composer open"
+    style="border: 1px solid #2f3f46; border-radius: 6px;"
+    width="49%"
+  />
+  <img
+    src="fixtures/diff.png"
+    alt="Wyrd Diff review view with a selected diff range and add-thread composer"
+    style="border: 1px solid #2f3f46; border-radius: 6px;"
+    width="49%"
+  />
+</p>
+
+The home view tracks active reviews across repositories and branches. The review
+view keeps the file tree, highlighted diff, line selection, and thread composer
+in one workspace.
+
 ## Quick start
 
 Requires Rust 1.91+, Node 24, pnpm 10. `mise` installs the toolchain.

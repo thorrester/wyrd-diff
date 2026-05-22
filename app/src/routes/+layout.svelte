@@ -161,7 +161,7 @@
       {/if}
       {#if bridge && agents.length}
         <ul class="agents">
-          {#each agents as agent}
+          {#each agents as agent (agent.id)}
             <li>
               <div class="row-head">
                 <span class="agent-name">{agent.display}</span>

@@ -94,7 +94,15 @@
   });
 
   type TreeNode =
-    | { kind: 'dir'; name: string; path: string; children: TreeNode[]; additions: number; deletions: number; fileCount: number }
+    | {
+        kind: 'dir';
+        name: string;
+        path: string;
+        children: TreeNode[];
+        additions: number;
+        deletions: number;
+        fileCount: number;
+      }
     | { kind: 'file'; name: string; path: string; item: ReviewFile };
 
   function buildTree(list: ReviewFile[]): TreeNode[] {
@@ -121,8 +129,7 @@
       cursor.files.push(item);
     }
     const sortDirs = (a: Dir, b: Dir) => a.name.localeCompare(b.name);
-    const sortFiles = (a: ReviewFile, b: ReviewFile) =>
-      a.file.path.localeCompare(b.file.path);
+    const sortFiles = (a: ReviewFile, b: ReviewFile) => a.file.path.localeCompare(b.file.path);
     const collapseChain = (dir: Dir): Dir => {
       while (dir.dirs.size === 1 && dir.files.length === 0) {
         const [only] = dir.dirs.values();
@@ -340,8 +347,7 @@
       const target = document.getElementById(fileId);
       const container = document.querySelector<HTMLElement>('section.diff');
       if (!target || !container) return;
-      const stickyOffset =
-        container.querySelector<HTMLElement>('.session-bar')?.offsetHeight ?? 0;
+      const stickyOffset = container.querySelector<HTMLElement>('.session-bar')?.offsetHeight ?? 0;
       const top = target.offsetTop - container.offsetTop - stickyOffset - 4;
       container.scrollTo({ top, behavior: 'smooth' });
     });
@@ -536,11 +542,7 @@
     document.getElementById('inline-thread-body')?.focus();
   }
 
-  function lineAnchorKey(
-    filePath: string,
-    oldLine: number | null,
-    newLine: number | null
-  ): string {
+  function lineAnchorKey(filePath: string, oldLine: number | null, newLine: number | null): string {
     return `${filePath}|${oldLine ?? ''}|${newLine ?? ''}`;
   }
 
@@ -872,7 +874,9 @@
           </div>
           <div class="batch-actions">
             <button on:click={copyBatchPayload}>Copy full markdown</button>
-            <button on:click={() => (batchPanelOpen = false)} aria-label="Close batch panel">×</button>
+            <button on:click={() => (batchPanelOpen = false)} aria-label="Close batch panel"
+              >×</button
+            >
           </div>
         </header>
         {#if batchBannerVisible}
@@ -893,7 +897,7 @@
             </p>
           {/if}
           <ul class="batch-threads">
-            {#each lastBatch.threads as bt, idx}
+            {#each lastBatch.threads as bt, idx (bt.thread_id)}
               {#if !hiddenBatchThreads.has(bt.thread_id)}
                 {@const thread = threadById(bt.thread_id)}
                 {@const section = sections[idx] ?? ''}
