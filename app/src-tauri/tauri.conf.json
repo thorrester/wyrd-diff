@@ -23,12 +23,7 @@
     "category": "DeveloperTool",
     "shortDescription": "Local diff review for coding agents",
     "longDescription": "Wyrd Diff pipes reviewer feedback back to the coding agent while it is still in session.",
-    "icon": [
-      "icons/32x32.png",
-      "icons/128x128.png",
-      "icons/icon.icns",
-      "icons/icon.png"
-    ],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.icns", "icons/icon.png"],
     "targets": ["app", "dmg", "deb", "appimage"],
     "macOS": {
       "minimumSystemVersion": "11.0"

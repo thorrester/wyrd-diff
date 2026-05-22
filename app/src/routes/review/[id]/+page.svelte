@@ -578,7 +578,11 @@
   }
 
   function threadLineLabel(thread: ReviewThreadRecord) {
-    const start = thread.range_start_new_line ?? thread.new_line ?? thread.range_start_old_line ?? thread.old_line;
+    const start =
+      thread.range_start_new_line ??
+      thread.new_line ??
+      thread.range_start_old_line ??
+      thread.old_line;
     const end = thread.range_end_new_line ?? thread.range_end_old_line ?? start;
     if (start == null) return '';
     if (end != null && end !== start) return `:${start}-${end}`;
@@ -1065,13 +1069,17 @@
       <section class="awaiting-panel" aria-label="Threads awaiting your reply">
         <header>
           <strong>Awaiting you</strong>
-          <span>{awaitingHumanThreads.length} thread{awaitingHumanThreads.length === 1 ? '' : 's'}</span>
+          <span
+            >{awaitingHumanThreads.length} thread{awaitingHumanThreads.length === 1
+              ? ''
+              : 's'}</span
+          >
           <button
             type="button"
             class="ghost"
             on:click={() => (onlyAgentReplies = false)}
-            title="Show all threads"
-          >Clear filter</button>
+            title="Show all threads">Clear filter</button
+          >
         </header>
         {#if awaitingHumanThreads.length === 0}
           <p class="awaiting-empty">No agent replies awaiting your action.</p>
@@ -1091,13 +1099,14 @@
                   <p class="awaiting-preview">{last.body}</p>
                 {/if}
                 <div class="awaiting-actions">
-                  <button type="button" on:click={() => jumpToThread(thread)}>Jump to thread</button>
+                  <button type="button" on:click={() => jumpToThread(thread)}>Jump to thread</button
+                  >
                   <button
                     type="button"
                     class="ghost"
                     on:click={() => resolveThread(thread)}
-                    title="Mark thread resolved"
-                  >Resolve</button>
+                    title="Mark thread resolved">Resolve</button
+                  >
                 </div>
               </li>
             {/each}
@@ -2440,7 +2449,9 @@
 
   @keyframes thread-flash {
     0% {
-      box-shadow: 0 0 0 2px var(--wm-red), 0 0 24px rgba(255, 90, 60, 0.55);
+      box-shadow:
+        0 0 0 2px var(--wm-red),
+        0 0 24px rgba(255, 90, 60, 0.55);
     }
     100% {
       box-shadow: 0 0 12px rgba(255, 90, 60, 0.22);
