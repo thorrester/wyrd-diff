@@ -8,6 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "lint": "eslint .",
     "format:check": "prettier --check .",
     "tauri": "tauri"

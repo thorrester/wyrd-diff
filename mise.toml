@@ -51,6 +51,7 @@ run = """
 pnpm --dir app format:check
 pnpm --dir app lint
 pnpm --dir app check
+pnpm --dir app test
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
