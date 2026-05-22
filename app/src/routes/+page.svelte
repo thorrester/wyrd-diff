@@ -1,6 +1,12 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { ApiAbortError, ApiTimeoutError, api, type OverviewEntry, type ReviewSession } from '$lib/api';
+  import {
+    ApiAbortError,
+    ApiTimeoutError,
+    api,
+    type OverviewEntry,
+    type ReviewSession
+  } from '$lib/api';
 
   const WORKTREE_REF = 'WORKTREE';
 
@@ -132,10 +138,10 @@
     homeDirSaving = true;
     homeDirError = '';
     try {
-      const response = await api<{ path: string; inferred: boolean }>(
-        '/api/settings/home-dir',
-        { method: 'PUT', body: { path: value } }
-      );
+      const response = await api<{ path: string; inferred: boolean }>('/api/settings/home-dir', {
+        method: 'PUT',
+        body: { path: value }
+      });
       homeDir = response.path;
       homeDirInferred = response.inferred;
       homeDirDraft = response.path;
