@@ -82,6 +82,7 @@ export type OverviewEntry = {
   session: ReviewSession;
   open_thread_count: number;
   pending_thread_count: number;
+  agent_reply_thread_count: number;
   agent_sessions: AgentSessionRecord[];
   updated_at: string;
 };

@@ -925,6 +925,7 @@ impl Database {
                 |row| row.get(0),
             )?;
             let pending_thread_count = self.pending_thread_count(&conn, &session.id)?;
+            let agent_reply_thread_count = self.agent_reply_thread_count(&conn, &session.id)?;
             let session_branch = session
                 .branch
                 .clone()
@@ -941,11 +942,30 @@ impl Database {
                 session,
                 open_thread_count,
                 pending_thread_count,
+                agent_reply_thread_count,
                 agent_sessions,
                 updated_at,
             });
         }
         Ok(out)
+    }
+
+    // Heuristic: counts open agent-visible threads whose newest non-private
+    // message is not from a human. Without a reviewer-side read watermark,
+    // this is the closest signal for "awaiting reviewer action."
+    fn agent_reply_thread_count(&self, conn: &Connection, session_id: &str) -> Result<i64> {
+        let count: i64 = conn.query_row(
+            "select count(*) from review_threads t
+             where t.session_id = ?1 and t.status = 'open' and t.visibility = 'agent'
+               and coalesce((
+                 select m.author_kind from thread_messages m
+                 where m.thread_id = t.id and m.visibility != 'private'
+                 order by m.created_at desc, m.id desc limit 1
+               ), 'human') != 'human'",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
     }
 
     fn pending_thread_count(&self, conn: &Connection, session_id: &str) -> Result<i64> {
