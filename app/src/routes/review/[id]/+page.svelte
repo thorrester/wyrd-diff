@@ -1,6 +1,6 @@
 <script lang="ts">
   import { page } from '$app/stores';
-  import { tick } from 'svelte';
+  import { onDestroy, tick } from 'svelte';
   import { marked } from 'marked';
   import hljs from 'highlight.js/lib/core';
   import bash from 'highlight.js/lib/languages/bash';
@@ -15,10 +15,13 @@
   import xml from 'highlight.js/lib/languages/xml';
   import yaml from 'highlight.js/lib/languages/yaml';
   import {
+    ApiAbortError,
+    ApiTimeoutError,
     api,
     apiBase,
     type FeedbackBatch,
     type ReviewFile,
+    type ReviewFileSummary,
     type ReviewSession,
     type ReviewDiffLine,
     type ReviewThreadRecord
@@ -65,6 +68,8 @@
   let dispatching = false;
   let batchPanelOpen = false;
   let collapsedBatchThreads = new Set<string>();
+  let hiddenBatchThreads = new Set<string>();
+  let resolvingThreadIds = new Set<string>();
   let copiedThreadId = '';
   let copiedThreadTimer: ReturnType<typeof setTimeout> | undefined;
   let batchPanelEl: HTMLElement | undefined;
@@ -179,6 +184,7 @@
     skipped.delete(item.file.id);
     collapsed.delete(item.file.id);
     files = files;
+    ensureFileLoadedById(item.file.id);
     scrollDiffTo(item.file.id);
   }
 
@@ -207,18 +213,94 @@
     return visible.slice(index + 1).some((message) => message.author_kind === 'human');
   }
 
-  async function load() {
-    const sessionData = await api<{ review_session: ReviewSession }>(
-      `/api/review-sessions/${sessionId}`
-    );
-    const diffData = await api<{ files: ReviewFile[] }>(`/api/review-sessions/${sessionId}/diff`);
-    const threadData = await api<{ threads: ReviewThreadRecord[] }>(
-      `/api/review-sessions/${sessionId}/threads`
-    );
-    session = sessionData.review_session;
-    files = diffData.files;
-    threads = threadData.threads;
+  let routeController: AbortController | null = null;
+  let loadGeneration = 0;
+
+  function ignorableError(err: unknown): boolean {
+    return err instanceof ApiAbortError || err instanceof ApiTimeoutError;
   }
+
+  let loadedPaths = new Set<string>();
+  const loadingPaths = new Set<string>();
+
+  async function fetchFileDiff(path: string, signal: AbortSignal, generation: number) {
+    if (loadedPaths.has(path) || loadingPaths.has(path)) return;
+    loadingPaths.add(path);
+    try {
+      const response = await api<{ file: ReviewFile | null }>(
+        `/api/review-sessions/${sessionId}/diff/file?path=${encodeURIComponent(path)}`,
+        { signal, timeoutMs: 30_000 }
+      );
+      if (generation !== loadGeneration) return;
+      if (!response.file) return;
+      const idx = files.findIndex((f) => f.file.path === path);
+      if (idx < 0) return;
+      files[idx] = response.file;
+      files = files;
+      loadedPaths.add(path);
+      loadedPaths = loadedPaths;
+    } catch (error) {
+      if (ignorableError(error)) return;
+      console.error(`failed to load diff for ${path}`, error);
+    } finally {
+      loadingPaths.delete(path);
+    }
+  }
+
+  async function load() {
+    routeController?.abort();
+    routeController = new AbortController();
+    const signal = routeController.signal;
+    const generation = ++loadGeneration;
+    try {
+      const sessionData = await api<{ review_session: ReviewSession }>(
+        `/api/review-sessions/${sessionId}`,
+        { signal, timeoutMs: 15_000 }
+      );
+      if (generation !== loadGeneration) return;
+      const diffData = await api<{ files: ReviewFileSummary[] }>(
+        `/api/review-sessions/${sessionId}/diff`,
+        { signal, timeoutMs: 15_000 }
+      );
+      if (generation !== loadGeneration) return;
+      const threadData = await api<{ threads: ReviewThreadRecord[] }>(
+        `/api/review-sessions/${sessionId}/threads`,
+        { signal, timeoutMs: 15_000 }
+      );
+      if (generation !== loadGeneration) return;
+      session = sessionData.review_session;
+      threads = threadData.threads;
+      loadedPaths = new Set<string>();
+      loadingPaths.clear();
+      files = diffData.files.map((summary) => ({ file: summary, hunks: [] }));
+
+      void hydrateFiles(signal, generation);
+    } catch (error) {
+      if (generation !== loadGeneration) return;
+      if (ignorableError(error)) return;
+      throw error;
+    }
+  }
+
+  async function hydrateFiles(signal: AbortSignal, generation: number) {
+    for (const item of files) {
+      if (generation !== loadGeneration) return;
+      if (skipped.has(item.file.id)) continue;
+      if (isLargeFile(item) && !revealedLarge.has(item.file.id)) continue;
+      await fetchFileDiff(item.file.path, signal, generation);
+    }
+  }
+
+  function ensureFileLoadedById(fileId: string) {
+    if (!routeController) return;
+    const item = files.find((f) => f.file.id === fileId);
+    if (!item) return;
+    void fetchFileDiff(item.file.path, routeController.signal, loadGeneration);
+  }
+
+  onDestroy(() => {
+    routeController?.abort();
+  });
 
   function toggle(set: Set<string>, id: string) {
     if (set.has(id)) set.delete(id);
@@ -280,6 +362,7 @@
   function showLargeFile(id: string) {
     revealedLarge.add(id);
     files = files;
+    ensureFileLoadedById(id);
   }
 
   function languageForPath(path: string) {
@@ -453,11 +536,18 @@
     document.getElementById('inline-thread-body')?.focus();
   }
 
+  function lineAnchorKey(
+    filePath: string,
+    oldLine: number | null,
+    newLine: number | null
+  ): string {
+    return `${filePath}|${oldLine ?? ''}|${newLine ?? ''}`;
+  }
+
   function groupThreadsByLine(items: ReviewThreadRecord[]) {
     const map = new Map<string, ReviewThreadRecord[]>();
     for (const thread of items) {
-      const key = thread.anchor_diff_line_id;
-      if (!key) continue;
+      const key = lineAnchorKey(thread.file_path, thread.old_line, thread.new_line);
       const list = map.get(key);
       if (list) list.push(thread);
       else map.set(key, [thread]);
@@ -538,6 +628,7 @@
       lastBatch = data.batch;
       batchPanelOpen = true;
       collapsedBatchThreads = new Set();
+      hiddenBatchThreads = new Set();
       flashBatchBanner();
       requestAnimationFrame(() => {
         batchPanelEl?.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -570,6 +661,38 @@
     if (next.has(threadId)) next.delete(threadId);
     else next.add(threadId);
     collapsedBatchThreads = next;
+  }
+
+  function hideBatchThread(threadId: string) {
+    const next = new Set(hiddenBatchThreads);
+    next.add(threadId);
+    hiddenBatchThreads = next;
+  }
+
+  function unhideAllBatchThreads() {
+    hiddenBatchThreads = new Set();
+  }
+
+  async function resolveBatchThread(threadId: string) {
+    const thread = threadById(threadId);
+    if (!thread) {
+      hideBatchThread(threadId);
+      return;
+    }
+    if (resolvingThreadIds.has(threadId)) return;
+    const next = new Set(resolvingThreadIds);
+    next.add(threadId);
+    resolvingThreadIds = next;
+    try {
+      await resolveThread(thread);
+      hideBatchThread(threadId);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    } finally {
+      const after = new Set(resolvingThreadIds);
+      after.delete(threadId);
+      resolvingThreadIds = after;
+    }
   }
 
   function batchThreadSections(payload: string): string[] {
@@ -763,43 +886,69 @@
           <p class="batch-empty">No open threads with new reviewer input.</p>
         {:else}
           {@const sections = batchThreadSections(lastBatch.payload)}
+          {#if hiddenBatchThreads.size > 0}
+            <p class="batch-hidden-note">
+              {hiddenBatchThreads.size} hidden
+              <button type="button" class="ghost" on:click={unhideAllBatchThreads}>show all</button>
+            </p>
+          {/if}
           <ul class="batch-threads">
             {#each lastBatch.threads as bt, idx}
-              {@const thread = threadById(bt.thread_id)}
-              {@const section = sections[idx] ?? ''}
-              {@const collapsed = collapsedBatchThreads.has(bt.thread_id)}
-              <li class="batch-thread" class:collapsed>
-                <button
-                  type="button"
-                  class="batch-thread-head"
-                  on:click={() => toggleBatchThread(bt.thread_id)}
-                  aria-expanded={!collapsed}
-                >
-                  <span class="caret">{collapsed ? '▶' : '▼'}</span>
-                  <span class="batch-thread-title">
-                    Thread {idx + 1} — {threadAnchorLabel(thread)}
-                  </span>
-                  <span class="batch-thread-meta">
-                    <span class="delivery">{bt.delivery_kind}</span>
-                    <span>{bt.message_ids.length} msg</span>
-                  </span>
-                </button>
-                {#if !collapsed}
-                  <div class="batch-thread-body">
-                    <div class="batch-thread-actions">
-                      <code class="thread-id">{bt.thread_id.slice(0, 8)}</code>
-                      <button
-                        type="button"
-                        class="ghost"
-                        on:click={() => copyBatchThread(bt.thread_id, section)}
-                      >
-                        {copiedThreadId === bt.thread_id ? 'copied' : 'copy thread'}
-                      </button>
+              {#if !hiddenBatchThreads.has(bt.thread_id)}
+                {@const thread = threadById(bt.thread_id)}
+                {@const section = sections[idx] ?? ''}
+                {@const collapsed = collapsedBatchThreads.has(bt.thread_id)}
+                {@const resolving = resolvingThreadIds.has(bt.thread_id)}
+                <li class="batch-thread" class:collapsed>
+                  <button
+                    type="button"
+                    class="batch-thread-head"
+                    on:click={() => toggleBatchThread(bt.thread_id)}
+                    aria-expanded={!collapsed}
+                  >
+                    <span class="caret">{collapsed ? '▶' : '▼'}</span>
+                    <span class="batch-thread-title">
+                      Thread {idx + 1} — {threadAnchorLabel(thread)}
+                    </span>
+                    <span class="batch-thread-meta">
+                      <span class="delivery">{bt.delivery_kind}</span>
+                      <span>{bt.message_ids.length} msg</span>
+                    </span>
+                  </button>
+                  {#if !collapsed}
+                    <div class="batch-thread-body">
+                      <div class="batch-thread-actions">
+                        <code class="thread-id">{bt.thread_id.slice(0, 8)}</code>
+                        <button
+                          type="button"
+                          class="ghost"
+                          on:click={() => copyBatchThread(bt.thread_id, section)}
+                        >
+                          {copiedThreadId === bt.thread_id ? 'copied' : 'copy thread'}
+                        </button>
+                        <button
+                          type="button"
+                          class="ghost"
+                          disabled={resolving}
+                          on:click={() => resolveBatchThread(bt.thread_id)}
+                          title="Mark thread resolved and hide from this batch"
+                        >
+                          {resolving ? 'resolving…' : 'resolve'}
+                        </button>
+                        <button
+                          type="button"
+                          class="ghost"
+                          on:click={() => hideBatchThread(bt.thread_id)}
+                          title="Hide from this batch view (does not change thread status)"
+                        >
+                          hide
+                        </button>
+                      </div>
+                      <pre>{section}</pre>
                     </div>
-                    <pre>{section}</pre>
-                  </div>
-                {/if}
-              </li>
+                  {/if}
+                </li>
+              {/if}
             {/each}
           </ul>
         {/if}
@@ -856,7 +1005,13 @@
                   {collapsed.has(item.file.id) ? 'Expand' : 'Collapse'}
                 </button>
               {/if}
-              <button on:click={() => toggle(skipped, item.file.id)}>Skip</button>
+              <button
+                on:click={() => {
+                  const wasSkipped = skipped.has(item.file.id);
+                  toggle(skipped, item.file.id);
+                  if (wasSkipped) ensureFileLoadedById(item.file.id);
+                }}>Skip</button
+              >
             </span>
           </h2>
           {#if isLargeHidden(item)}
@@ -952,7 +1107,7 @@
                         </td>
                       </tr>
                     {/if}
-                    {#each threadsByLine.get(line.id) ?? [] as thread (thread.id)}
+                    {#each threadsByLine.get(lineAnchorKey(line.file_path, line.old_line, line.new_line)) ?? [] as thread (thread.id)}
                       <tr class="thread-row">
                         <td colspan="3">
                           <section
@@ -1430,6 +1585,15 @@
     margin: 0;
     color: var(--wm-muted);
     font-size: 12px;
+  }
+
+  .batch-hidden-note {
+    margin: 0 0 6px;
+    color: var(--wm-muted);
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
 
   .batch-threads {

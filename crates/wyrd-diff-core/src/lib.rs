@@ -13,5 +13,5 @@ pub use db::{
     NewReviewSession, NewReviewThread, NewThreadMessage,
 };
 pub use export::{AgentContext, TrajectoryRecord};
-pub use git::{DiffFile, DiffHunk, DiffLine, GitRepo};
+pub use git::{DiffFile, DiffHunk, DiffLine, GitRepo, RepoCandidate, scan_repos};
 pub use models::*;

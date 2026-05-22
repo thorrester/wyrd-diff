@@ -83,6 +83,25 @@ pub struct AgentSessionRecord {
     pub ended_at: Option<String>,
 }
 
+/// Aggregated entry for one (repo, branch) active review used by the fleet view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverviewEntry {
+    /// Repository.
+    pub repo: RepoRecord,
+    /// Branch this entry covers.
+    pub branch: String,
+    /// Active review session for the branch.
+    pub session: ReviewSessionRecord,
+    /// Open thread count.
+    pub open_thread_count: i64,
+    /// Threads with new reviewer input awaiting agent pull.
+    pub pending_thread_count: i64,
+    /// Agent sessions seen on this branch within the idle window.
+    pub agent_sessions: Vec<AgentSessionRecord>,
+    /// Last activation timestamp.
+    pub updated_at: String,
+}
+
 /// Commit captured in a review session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitRecord {

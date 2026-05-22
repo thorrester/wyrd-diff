@@ -25,6 +25,14 @@ pub struct ApiState {
     mcp_url: String,
 }
 
+impl ApiState {
+    /// Build shared state for tests and embedders.
+    #[must_use]
+    pub fn new(db: Database, token: String, mcp_url: String) -> Self {
+        Self { db, token, mcp_url }
+    }
+}
+
 /// API error response.
 #[derive(Debug, Serialize)]
 pub struct ApiError {
@@ -116,7 +124,8 @@ pub fn router(state: Arc<ApiState>) -> Router {
             get(review_sessions).post(create_review_session),
         )
         .route("/api/review-sessions/:id", get(review_session))
-        .route("/api/review-sessions/:id/diff", get(review_diff))
+        .route("/api/review-sessions/:id/diff", get(review_diff_summary))
+        .route("/api/review-sessions/:id/diff/file", get(review_diff_file))
         .route(
             "/api/review-sessions/:id/refresh",
             post(refresh_review_session),
@@ -141,6 +150,17 @@ pub fn router(state: Arc<ApiState>) -> Router {
             get(list_feedback_batches).post(create_feedback_batch),
         )
         .route("/api/review-sessions/:id/agent-context", get(agent_context))
+        .route(
+            "/api/review-sessions/:id/agent-sessions",
+            get(agent_sessions_for_review),
+        )
+        .route("/api/overview", get(overview))
+        .route(
+            "/api/settings/home-dir",
+            get(get_home_dir).put(put_home_dir),
+        )
+        .route("/api/repo-scan", get(repo_scan))
+        .route("/api/repo-branches", get(repo_branches))
         .route("/api/export/trajectory.jsonl", get(export_trajectory))
         .route("/mcp", post(mcp_endpoint).get(mcp_get))
         .route("/api/configure-agents", post(configure_agents_endpoint))
@@ -162,10 +182,12 @@ async fn status(State(state): State<Arc<ApiState>>) -> Json<serde_json::Value> {
 async fn agent_status_endpoint(
     State(state): State<Arc<ApiState>>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let statuses =
-        wyrd_diff_core::agent_config::agent_status(&state.mcp_url).map_err(|e| ApiError {
+    let mcp_url = state.mcp_url.clone();
+    let statuses = run_blocking(move || wyrd_diff_core::agent_config::agent_status(&mcp_url))
+        .await
+        .map_err(|e| ApiError {
             code: "agent_status_failed".to_string(),
-            message: format!("{e:#}"),
+            message: e.message,
         })?;
     let results: Vec<serde_json::Value> = statuses
         .into_iter()
@@ -196,10 +218,14 @@ async fn configure_agents_endpoint(
     State(state): State<Arc<ApiState>>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let url = state.mcp_url.clone();
-    let writes = wyrd_diff_core::agent_config::configure_agents(&url).map_err(|e| ApiError {
-        code: "configure_agents_failed".to_string(),
-        message: format!("{e:#}"),
-    })?;
+    let url_for_task = url.clone();
+    let writes =
+        run_blocking(move || wyrd_diff_core::agent_config::configure_agents(&url_for_task))
+            .await
+            .map_err(|e| ApiError {
+                code: "configure_agents_failed".to_string(),
+                message: e.message,
+            })?;
     let results: Vec<serde_json::Value> = writes
         .into_iter()
         .map(|w| {
@@ -223,10 +249,14 @@ async fn configure_agent_endpoint(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let url = state.mcp_url.clone();
-    let write = wyrd_diff_core::agent_config::configure_agent(&id, &url).map_err(|e| ApiError {
-        code: "configure_agent_failed".to_string(),
-        message: format!("{e:#}"),
-    })?;
+    let url_for_task = url.clone();
+    let write =
+        run_blocking(move || wyrd_diff_core::agent_config::configure_agent(&id, &url_for_task))
+            .await
+            .map_err(|e| ApiError {
+                code: "configure_agent_failed".to_string(),
+                message: e.message,
+            })?;
     Ok(Json(serde_json::json!({
         "url": url,
         "result": {
@@ -272,9 +302,9 @@ async fn repos(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
-    Ok(Json(
-        serde_json::json!({ "repos": state.db.repos().map_err(api_err)? }),
-    ))
+    let db = state.db.clone();
+    let repos = run_blocking(move || db.repos()).await?;
+    Ok(Json(serde_json::json!({ "repos": repos })))
 }
 
 async fn upsert_repo(
@@ -283,9 +313,9 @@ async fn upsert_repo(
     Json(input): Json<NewRepo>,
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
-    Ok(Json(
-        serde_json::json!({ "repo": state.db.upsert_repo(input).map_err(api_err)? }),
-    ))
+    let db = state.db.clone();
+    let repo = run_blocking(move || db.upsert_repo(input)).await?;
+    Ok(Json(serde_json::json!({ "repo": repo })))
 }
 
 async fn review_sessions(
@@ -293,9 +323,9 @@ async fn review_sessions(
     headers: HeaderMap,
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
-    Ok(Json(
-        serde_json::json!({ "review_sessions": state.db.review_sessions().map_err(api_err)? }),
-    ))
+    let db = state.db.clone();
+    let sessions = run_blocking(move || db.review_sessions()).await?;
+    Ok(Json(serde_json::json!({ "review_sessions": sessions })))
 }
 
 async fn create_review_session(
@@ -304,9 +334,9 @@ async fn create_review_session(
     Json(input): Json<NewReviewSession>,
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
-    Ok(Json(serde_json::json!({
-        "review_session": state.db.create_review_session(input).map_err(api_err)?
-    })))
+    let db = state.db.clone();
+    let session = run_blocking(move || db.create_review_session(input)).await?;
+    Ok(Json(serde_json::json!({ "review_session": session })))
 }
 
 async fn review_session(
@@ -315,20 +345,38 @@ async fn review_session(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
-    Ok(Json(
-        serde_json::json!({ "review_session": state.db.review_session(&id).map_err(api_err)? }),
-    ))
+    let db = state.db.clone();
+    let session = run_blocking(move || db.review_session(&id)).await?;
+    Ok(Json(serde_json::json!({ "review_session": session })))
 }
 
-async fn review_diff(
+async fn review_diff_summary(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
-    Ok(Json(
-        serde_json::json!({ "files": state.db.review_diff(&id).map_err(api_err)? }),
-    ))
+    let db = state.db.clone();
+    let files = run_blocking(move || db.review_diff_summary(&id)).await?;
+    Ok(Json(serde_json::json!({ "files": files })))
+}
+
+#[derive(Debug, Deserialize)]
+struct DiffFileQuery {
+    path: String,
+}
+
+async fn review_diff_file(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<DiffFileQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    authorize(&state, &headers)?;
+    let db = state.db.clone();
+    let file_path = query.path;
+    let file = run_blocking(move || db.review_diff_file(&id, &file_path)).await?;
+    Ok(Json(serde_json::json!({ "file": file })))
 }
 
 async fn refresh_review_session(
@@ -337,9 +385,9 @@ async fn refresh_review_session(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
-    Ok(Json(serde_json::json!({
-        "review_session": state.db.refresh_review_session(&id).map_err(api_err)?
-    })))
+    let db = state.db.clone();
+    let session = run_blocking(move || db.refresh_review_session(&id)).await?;
+    Ok(Json(serde_json::json!({ "review_session": session })))
 }
 
 async fn add_comment(
@@ -350,9 +398,9 @@ async fn add_comment(
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
     input.session_id = id;
-    Ok(Json(
-        serde_json::json!({ "id": state.db.add_comment(input).map_err(api_err)? }),
-    ))
+    let db = state.db.clone();
+    let comment_id = run_blocking(move || db.add_comment(input)).await?;
+    Ok(Json(serde_json::json!({ "id": comment_id })))
 }
 
 async fn review_threads(
@@ -361,9 +409,9 @@ async fn review_threads(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
-    Ok(Json(
-        serde_json::json!({ "threads": state.db.review_threads(&id).map_err(api_err)? }),
-    ))
+    let db = state.db.clone();
+    let threads = run_blocking(move || db.review_threads(&id)).await?;
+    Ok(Json(serde_json::json!({ "threads": threads })))
 }
 
 async fn add_review_thread(
@@ -374,9 +422,9 @@ async fn add_review_thread(
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
     input.session_id = id;
-    Ok(Json(
-        serde_json::json!({ "thread": state.db.add_review_thread(input).map_err(api_err)? }),
-    ))
+    let db = state.db.clone();
+    let thread = run_blocking(move || db.add_review_thread(input)).await?;
+    Ok(Json(serde_json::json!({ "thread": thread })))
 }
 
 async fn delete_review_thread(
@@ -385,7 +433,8 @@ async fn delete_review_thread(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
-    let removed = state.db.delete_review_thread(&id).map_err(api_err)?;
+    let db = state.db.clone();
+    let removed = run_blocking(move || db.delete_review_thread(&id)).await?;
     Ok(Json(serde_json::json!({ "deleted": removed })))
 }
 
@@ -395,7 +444,8 @@ async fn resolve_thread(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
-    let updated = state.db.resolve_thread(&id).map_err(api_err)?;
+    let db = state.db.clone();
+    let updated = run_blocking(move || db.resolve_thread(&id)).await?;
     Ok(Json(
         serde_json::json!({ "updated": updated, "status": "resolved" }),
     ))
@@ -407,7 +457,8 @@ async fn reopen_thread(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
-    let updated = state.db.reopen_thread(&id).map_err(api_err)?;
+    let db = state.db.clone();
+    let updated = run_blocking(move || db.reopen_thread(&id)).await?;
     Ok(Json(
         serde_json::json!({ "updated": updated, "status": "open" }),
     ))
@@ -427,10 +478,8 @@ async fn create_feedback_batch(
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
     let input = body.map(|Json(value)| value).unwrap_or_default();
-    let batch = state
-        .db
-        .create_feedback_batch(&id, input.agent_session_id)
-        .map_err(api_err)?;
+    let db = state.db.clone();
+    let batch = run_blocking(move || db.create_feedback_batch(&id, input.agent_session_id)).await?;
     Ok(Json(serde_json::json!({ "batch": batch })))
 }
 
@@ -440,9 +489,9 @@ async fn list_feedback_batches(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
-    Ok(Json(
-        serde_json::json!({ "batches": state.db.feedback_batches(&id).map_err(api_err)? }),
-    ))
+    let db = state.db.clone();
+    let batches = run_blocking(move || db.feedback_batches(&id)).await?;
+    Ok(Json(serde_json::json!({ "batches": batches })))
 }
 
 async fn add_thread_message(
@@ -453,9 +502,9 @@ async fn add_thread_message(
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
     input.thread_id = id;
-    Ok(Json(
-        serde_json::json!({ "message": state.db.add_thread_message(input).map_err(api_err)? }),
-    ))
+    let db = state.db.clone();
+    let message = run_blocking(move || db.add_thread_message(input)).await?;
+    Ok(Json(serde_json::json!({ "message": message })))
 }
 
 async fn add_note(
@@ -466,9 +515,9 @@ async fn add_note(
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
     input.session_id = Some(id);
-    Ok(Json(
-        serde_json::json!({ "id": state.db.add_note(input).map_err(api_err)? }),
-    ))
+    let db = state.db.clone();
+    let note_id = run_blocking(move || db.add_note(input)).await?;
+    Ok(Json(serde_json::json!({ "id": note_id })))
 }
 
 async fn add_decision(
@@ -479,9 +528,9 @@ async fn add_decision(
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
     input.session_id = Some(id);
-    Ok(Json(
-        serde_json::json!({ "id": state.db.add_decision(input).map_err(api_err)? }),
-    ))
+    let db = state.db.clone();
+    let decision_id = run_blocking(move || db.add_decision(input)).await?;
+    Ok(Json(serde_json::json!({ "id": decision_id })))
 }
 
 async fn import_fix(
@@ -492,9 +541,9 @@ async fn import_fix(
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
     input.session_id = id;
-    Ok(Json(
-        serde_json::json!({ "id": state.db.import_fix(input).map_err(api_err)? }),
-    ))
+    let db = state.db.clone();
+    let fix_id = run_blocking(move || db.import_fix(input)).await?;
+    Ok(Json(serde_json::json!({ "id": fix_id })))
 }
 
 async fn fix_imports(
@@ -503,9 +552,9 @@ async fn fix_imports(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
-    Ok(Json(
-        serde_json::json!({ "fix_imports": state.db.fix_imports(&id).map_err(api_err)? }),
-    ))
+    let db = state.db.clone();
+    let imports = run_blocking(move || db.fix_imports(&id)).await?;
+    Ok(Json(serde_json::json!({ "fix_imports": imports })))
 }
 
 async fn agent_context(
@@ -514,9 +563,139 @@ async fn agent_context(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     authorize(&state, &headers)?;
-    Ok(Json(serde_json::json!(
-        state.db.agent_context(&id).map_err(api_err)?
-    )))
+    let db = state.db.clone();
+    let context = run_blocking(move || db.agent_context(&id)).await?;
+    Ok(Json(serde_json::json!(context)))
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentSessionsQuery {
+    idle_seconds: Option<i64>,
+}
+
+async fn agent_sessions_for_review(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<AgentSessionsQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    authorize(&state, &headers)?;
+    let cutoff = query.idle_seconds.unwrap_or(24 * 3600);
+    let db = state.db.clone();
+    let sessions = run_blocking(move || db.agent_sessions_for_review(&id, cutoff)).await?;
+    Ok(Json(serde_json::json!({ "agent_sessions": sessions })))
+}
+
+#[derive(Debug, Deserialize)]
+struct HomeDirInput {
+    path: String,
+}
+
+async fn get_home_dir(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    authorize(&state, &headers)?;
+    let (view, settings_path) = run_blocking(move || {
+        let view = wyrd_diff_core::agent_config::home_dir_view_env()?;
+        let settings_path = wyrd_diff_core::agent_config::user_config_path_env()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string());
+        Ok((view, settings_path))
+    })
+    .await?;
+    Ok(Json(serde_json::json!({
+        "path": view.home_dir,
+        "inferred": view.inferred,
+        "settings_path": settings_path,
+    })))
+}
+
+async fn put_home_dir(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Json(input): Json<HomeDirInput>,
+) -> ApiResult<Json<serde_json::Value>> {
+    authorize(&state, &headers)?;
+    let raw = input.path;
+    let expanded = run_blocking(move || {
+        let expanded = wyrd_diff_core::agent_config::expand_user_path_env(&raw);
+        wyrd_diff_core::agent_config::set_home_dir_env(&expanded)?;
+        Ok(expanded)
+    })
+    .await?;
+    Ok(Json(serde_json::json!({
+        "path": expanded,
+        "inferred": false,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct RepoScanQuery {
+    path: Option<String>,
+}
+
+async fn repo_scan(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<RepoScanQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    authorize(&state, &headers)?;
+    let query_path = query.path;
+    let (home, repos) = run_blocking(move || {
+        let home_raw = match query_path {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                let view = wyrd_diff_core::agent_config::home_dir_view_env()?;
+                view.home_dir.ok_or_else(|| {
+                    anyhow::anyhow!("home_dir is not configured and could not be inferred")
+                })?
+            }
+        };
+        let home = wyrd_diff_core::agent_config::expand_user_path_env(&home_raw);
+        let repos = wyrd_diff_core::scan_repos(std::path::Path::new(&home))?;
+        Ok((home, repos))
+    })
+    .await?;
+    Ok(Json(serde_json::json!({ "home": home, "repos": repos })))
+}
+
+#[derive(Debug, Deserialize)]
+struct RepoBranchesQuery {
+    path: String,
+}
+
+async fn repo_branches(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<RepoBranchesQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    authorize(&state, &headers)?;
+    let raw_path = query.path;
+    let (branches, default_branch) = run_blocking(move || {
+        let path = wyrd_diff_core::agent_config::expand_user_path_env(&raw_path);
+        let repo = wyrd_diff_core::GitRepo::open(&path)?;
+        let branches = repo.branches()?;
+        let default_branch = repo.default_branch()?;
+        Ok((branches, default_branch))
+    })
+    .await?;
+    Ok(Json(serde_json::json!({
+        "branches": branches,
+        "default_branch": default_branch,
+    })))
+}
+
+async fn overview(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<AgentSessionsQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    authorize(&state, &headers)?;
+    let cutoff = query.idle_seconds.unwrap_or(24 * 3600);
+    let db = state.db.clone();
+    let entries = run_blocking(move || db.overview(cutoff)).await?;
+    Ok(Json(serde_json::json!({ "entries": entries })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -530,16 +709,18 @@ async fn export_trajectory(
     axum::extract::Query(query): axum::extract::Query<ExportQuery>,
 ) -> ApiResult<String> {
     authorize(&state, &headers)?;
-    let records = state
-        .db
-        .trajectory_records(query.repo_id.as_deref())
-        .map_err(api_err)?;
-    let mut lines = String::new();
-    for record in records {
-        lines.push_str(&serde_json::to_string(&record).map_err(api_err)?);
-        lines.push('\n');
-    }
-    Ok(lines)
+    let db = state.db.clone();
+    let repo_id = query.repo_id;
+    run_blocking(move || {
+        let records = db.trajectory_records(repo_id.as_deref())?;
+        let mut lines = String::new();
+        for record in records {
+            lines.push_str(&serde_json::to_string(&record)?);
+            lines.push('\n');
+        }
+        Ok(lines)
+    })
+    .await
 }
 
 fn authorize(state: &ApiState, headers: &HeaderMap) -> ApiResult<()> {
@@ -567,5 +748,23 @@ fn api_err(error: impl std::fmt::Display) -> ApiError {
     ApiError {
         code: "WYRD_DIFF_REQUEST_FAILED".to_string(),
         message: error.to_string(),
+    }
+}
+
+/// Run a blocking closure on the Tokio blocking pool and normalize errors into
+/// `ApiError`. Use for SQLite, filesystem, or git subprocess work that would
+/// otherwise stall the async runtime.
+async fn run_blocking<F, T>(f: F) -> ApiResult<T>
+where
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(api_err(err)),
+        Err(join) => Err(ApiError {
+            code: "WYRD_DIFF_BLOCKING_TASK_FAILED".to_string(),
+            message: join.to_string(),
+        }),
     }
 }

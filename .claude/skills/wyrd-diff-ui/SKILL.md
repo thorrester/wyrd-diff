@@ -8,10 +8,11 @@ description: Repo-local wyrd-diff skill for modern SvelteKit, Svelte 5, TypeScri
 Use this skill before touching the SvelteKit/Tauri frontend under `app/src/`
 or related UI assets under `app/static/`.
 
-`wyrd-diff` is a local engineering memory tool for review comments, private
-notes, durable decisions, agent handoff packets, and accepted fix trajectory.
-The UI should feel like a modern working surface for repeated engineering use,
-not a marketing site.
+`wyrd-diff` is a local diff review tool that pipes a developer's review back
+to the coding agent while it is still in session. The UI surfaces diffs,
+line-level comments, queued feedback batches, agent dispatch state, and the
+resulting fix trajectory. It should feel like a modern working surface for
+repeated review use, not a marketing site.
 
 ## First Pass
 

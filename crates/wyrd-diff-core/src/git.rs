@@ -1,6 +1,7 @@
 //! Git command integration and unified diff parsing.
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, FixedOffset, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf, process::Command};
 
@@ -23,6 +24,10 @@ pub struct DiffFile {
     pub additions: i64,
     /// Deleted line count.
     pub deletions: i64,
+    /// Raw unified-diff text for this file, including the `diff --git` header
+    /// and every hunk. Suitable for reparse via [`parse_unified_diff`].
+    #[serde(default)]
+    pub patch_blob: String,
     /// Parsed hunks.
     pub hunks: Vec<DiffHunk>,
 }
@@ -74,57 +79,89 @@ impl GitRepo {
         &self.path
     }
 
+    fn open_repo(&self) -> Result<git2::Repository> {
+        git2::Repository::open(&self.path)
+            .with_context(|| format!("libgit2 open {}", self.path.display()))
+    }
+
     /// Resolve a ref to a full sha.
     ///
     /// The pseudo-ref `WORKTREE` resolves to the current `HEAD` sha so that callers
     /// have a real anchor while diffing uncommitted tracked changes.
     ///
     /// # Errors
-    /// Returns an error when git cannot resolve the ref.
+    /// Returns an error when libgit2 cannot resolve the ref.
     pub fn resolve_ref(&self, reference: &str) -> Result<String> {
         let target = if reference == "WORKTREE" {
             "HEAD"
         } else {
             reference
         };
-        Ok(self.git(["rev-parse", target])?.trim().to_string())
+        let repo = self.open_repo()?;
+        let obj = repo
+            .revparse_single(target)
+            .with_context(|| format!("resolve ref {target}"))?;
+        let oid = obj
+            .peel_to_commit()
+            .map(|c| c.id())
+            .unwrap_or_else(|_| obj.id());
+        Ok(oid.to_string())
     }
 
-    /// Return commits in base..head order.
+    /// Return commits in base..head order (oldest first).
     ///
     /// The pseudo-ref `WORKTREE` is rewritten to `HEAD` so that committed history up
     /// to the working tree is still captured alongside the uncommitted diff.
     ///
     /// # Errors
-    /// Returns an error when git log fails.
+    /// Returns an error when libgit2 cannot walk the revision range.
     pub fn commits(&self, base: &str, head: &str) -> Result<Vec<CommitInfo>> {
         let head = if head == "WORKTREE" { "HEAD" } else { head };
-        let format = "%H%x1f%h%x1f%s%x1f%b%x1f%an%x1f%ae%x1f%aI%x1e";
-        let output = self.git([
-            "log",
-            "--reverse",
-            &format!("--format={format}"),
-            &format!("{base}..{head}"),
-        ])?;
-        Ok(output
-            .split('\x1e')
-            .filter_map(|row| {
-                let row = row.trim_matches('\n');
-                if row.is_empty() {
-                    return None;
-                }
-                let parts: Vec<_> = row.split('\x1f').collect();
-                Some(CommitInfo {
-                    sha: parts.first().unwrap_or(&"").to_string(),
-                    short_sha: parts.get(1).unwrap_or(&"").to_string(),
-                    subject: parts.get(2).unwrap_or(&"").to_string(),
-                    body: empty_to_none(parts.get(3).copied().unwrap_or("")),
-                    author_name: empty_to_none(parts.get(4).copied().unwrap_or("")),
-                    author_email: empty_to_none(parts.get(5).copied().unwrap_or("")),
-                    authored_at: empty_to_none(parts.get(6).copied().unwrap_or("")),
-                })
-            })
-            .collect())
+        let repo = self.open_repo()?;
+        let base_oid = repo
+            .revparse_single(base)
+            .with_context(|| format!("resolve base ref {base}"))?
+            .peel_to_commit()?
+            .id();
+        let head_oid = repo
+            .revparse_single(head)
+            .with_context(|| format!("resolve head ref {head}"))?
+            .peel_to_commit()?
+            .id();
+        let mut walk = repo.revwalk()?;
+        walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
+        walk.push(head_oid)?;
+        walk.hide(base_oid)?;
+
+        let mut out = Vec::new();
+        for oid in walk {
+            let oid = oid?;
+            let commit = repo.find_commit(oid)?;
+            let sha = oid.to_string();
+            let short_sha = sha.chars().take(7).collect::<String>();
+            let summary = commit.summary().unwrap_or("").to_string();
+            let body = commit
+                .message()
+                .and_then(|m| m.split_once("\n\n").map(|(_, b)| b.trim_end().to_string()))
+                .filter(|s| !s.is_empty());
+            let author = commit.author();
+            let author_name =
+                Some(author.name().unwrap_or("").to_string()).filter(|s| !s.is_empty());
+            let author_email =
+                Some(author.email().unwrap_or("").to_string()).filter(|s| !s.is_empty());
+            let when = author.when();
+            let authored_at = format_git_time(when.seconds(), when.offset_minutes());
+            out.push(CommitInfo {
+                sha,
+                short_sha,
+                subject: summary,
+                body,
+                author_name,
+                author_email,
+                authored_at,
+            });
+        }
+        Ok(out)
     }
 
     /// Return parsed diff files for base..head.
@@ -136,21 +173,48 @@ impl GitRepo {
     /// skipped. Binary untracked files are emitted as a stub diff.
     ///
     /// # Errors
-    /// Returns an error when git diff fails or untracked files cannot be read.
+    /// Returns an error when libgit2 diff fails or untracked files cannot be read.
     pub fn diff_files(&self, base: &str, head: &str) -> Result<Vec<DiffFile>> {
-        let diff = if head == "WORKTREE" {
-            let mut combined = self.git(["diff", "--find-renames", "--unified=80", base])?;
+        let diff_text = if head == "WORKTREE" {
+            let mut combined = self.git(["diff", "--find-renames", "--unified=3", base])?;
             combined.push_str(&self.synthesize_untracked_diff()?);
             combined
         } else {
-            self.git([
-                "diff",
-                "--find-renames",
-                "--unified=80",
-                &format!("{base}..{head}"),
-            ])?
+            self.libgit2_tree_diff(base, head)?
         };
-        Ok(parse_unified_diff(&diff))
+        Ok(parse_unified_diff(&diff_text))
+    }
+
+    fn libgit2_tree_diff(&self, base: &str, head: &str) -> Result<String> {
+        let repo = self.open_repo()?;
+        let base_tree = repo
+            .revparse_single(base)
+            .with_context(|| format!("resolve base ref {base}"))?
+            .peel_to_commit()?
+            .tree()?;
+        let head_tree = repo
+            .revparse_single(head)
+            .with_context(|| format!("resolve head ref {head}"))?
+            .peel_to_commit()?
+            .tree()?;
+        let mut opts = git2::DiffOptions::new();
+        opts.context_lines(3);
+        let mut diff =
+            repo.diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut opts))?;
+        let mut find_opts = git2::DiffFindOptions::new();
+        find_opts.renames(true);
+        diff.find_similar(Some(&mut find_opts))?;
+
+        let mut out = String::new();
+        diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+            let origin = line.origin();
+            if matches!(origin, '+' | '-' | ' ') {
+                out.push(origin);
+            }
+            out.push_str(std::str::from_utf8(line.content()).unwrap_or(""));
+            true
+        })?;
+        Ok(out)
     }
 
     fn synthesize_untracked_diff(&self) -> Result<String> {
@@ -202,6 +266,61 @@ impl GitRepo {
         Ok(header)
     }
 
+    /// List branches in the repository.
+    ///
+    /// Returns local branches first (refs/heads), then remote branches
+    /// (refs/remotes) with the remote prefix stripped (e.g. `origin/main` →
+    /// `origin/main`). `HEAD` symbolic refs are skipped.
+    ///
+    /// # Errors
+    /// Returns an error when git fails to enumerate refs.
+    pub fn branches(&self) -> Result<Vec<String>> {
+        let raw = self.git([
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+        ])?;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for line in raw.lines() {
+            let name = line.trim();
+            if name.is_empty() || name.ends_with("/HEAD") {
+                continue;
+            }
+            if seen.insert(name.to_string()) {
+                out.push(name.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Return the repository's default branch, if discoverable.
+    ///
+    /// Tries `refs/remotes/origin/HEAD` symbolic ref first, then falls back to
+    /// the current `HEAD` branch name.
+    ///
+    /// # Errors
+    /// Returns an error when both lookups fail.
+    pub fn default_branch(&self) -> Result<Option<String>> {
+        if let Ok(value) = self.git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
+            let name = value.trim();
+            if let Some(stripped) = name.strip_prefix("origin/") {
+                return Ok(Some(stripped.to_string()));
+            }
+            if !name.is_empty() {
+                return Ok(Some(name.to_string()));
+            }
+        }
+        if let Ok(value) = self.git(["rev-parse", "--abbrev-ref", "HEAD"]) {
+            let name = value.trim();
+            if !name.is_empty() && name != "HEAD" {
+                return Ok(Some(name.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
     /// Return raw diff for a commit.
     ///
     /// # Errors
@@ -223,6 +342,52 @@ impl GitRepo {
     }
 }
 
+/// Scanned repository candidate from a home directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoCandidate {
+    /// Directory name.
+    pub name: String,
+    /// Absolute path.
+    pub path: String,
+}
+
+/// Scan a directory for top-level git repositories.
+///
+/// Returns directories under `home` that contain a `.git` entry (file or
+/// directory). Hidden entries (starting with `.`) are skipped. Results sorted
+/// by name, case-insensitive.
+///
+/// # Errors
+/// Returns an error when `home` is not readable.
+pub fn scan_repos(home: &std::path::Path) -> Result<Vec<RepoCandidate>> {
+    let entries = fs::read_dir(home)
+        .with_context(|| format!("failed to read directory: {}", home.display()))?;
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if !path.join(".git").exists() {
+            continue;
+        }
+        out.push(RepoCandidate {
+            name,
+            path: path.to_string_lossy().to_string(),
+        });
+    }
+    out.sort_by_key(|r| r.name.to_lowercase());
+    Ok(out)
+}
+
 /// Commit metadata captured for review sessions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitInfo {
@@ -242,13 +407,13 @@ pub struct CommitInfo {
     pub authored_at: Option<String>,
 }
 
-fn empty_to_none(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+fn format_git_time(seconds: i64, offset_minutes: i32) -> Option<String> {
+    let utc: DateTime<Utc> = DateTime::from_timestamp(seconds, 0)?;
+    let tz = FixedOffset::east_opt(offset_minutes * 60)?;
+    Some(
+        utc.with_timezone(&tz)
+            .to_rfc3339_opts(SecondsFormat::Secs, false),
+    )
 }
 
 fn parse_hunk_header(line: &str) -> Option<(i64, i64, i64, i64)> {
@@ -287,12 +452,16 @@ pub fn parse_unified_diff(diff: &str) -> Vec<DiffFile> {
             if let Some(file) = current_file.take() {
                 files.push(file);
             }
+            let mut blob = String::with_capacity(line.len() + 1);
+            blob.push_str(line);
+            blob.push('\n');
             current_file = Some(DiffFile {
                 path: line.to_string(),
                 old_path: None,
                 status: "modified".to_string(),
                 additions: 0,
                 deletions: 0,
+                patch_blob: blob,
                 hunks: Vec::new(),
             });
             continue;
@@ -301,6 +470,8 @@ pub fn parse_unified_diff(diff: &str) -> Vec<DiffFile> {
         let Some(file) = current_file.as_mut() else {
             continue;
         };
+        file.patch_blob.push_str(line);
+        file.patch_blob.push('\n');
 
         if let Some(path) = line.strip_prefix("+++ b/") {
             file.path = path.to_string();

@@ -2,23 +2,40 @@
 
 use crate::{
     ActiveReviewSessionRecord, AgentSessionRecord, FeedbackBatchRecord, FeedbackBatchThreadRecord,
-    FileRecord, FixImportRecord, GitRepo, RepoRecord, ReviewDiffLine, ReviewFileDiff, ReviewHunk,
-    ReviewSessionRecord, ReviewThreadRecord, SourceContext, ThreadMessageRecord,
+    FileRecord, FixImportRecord, GitRepo, OverviewEntry, RepoRecord, ReviewDiffLine,
+    ReviewFileDiff, ReviewHunk, ReviewSessionRecord, ReviewThreadRecord, SourceContext,
+    ThreadMessageRecord,
     export::{AgentContext, TrajectoryRecord},
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
+use r2d2::{Pool, PooledConnection};
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
+use tracing::{debug, info_span};
 use uuid::Uuid;
 
 const INIT_SQL: &str = include_str!("../../../migrations/001_init.sql");
 
-/// SQLite database handle.
+/// Pooled SQLite connection alias.
+pub type PooledConn = PooledConnection<SqliteConnectionManager>;
+
+/// SQLite database handle. Cheap to clone; backing pool is shared.
 #[derive(Debug, Clone)]
 pub struct Database {
+    inner: Arc<DatabaseInner>,
+}
+
+#[derive(Debug)]
+struct DatabaseInner {
     path: PathBuf,
+    pool: OnceLock<Pool<SqliteConnectionManager>>,
 }
 
 /// Repository creation payload.
@@ -234,31 +251,59 @@ pub struct NewFixImport {
 }
 
 impl Database {
-    /// Create a database wrapper.
+    /// Create a database wrapper. Pool is built lazily on first connect.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            inner: Arc::new(DatabaseInner {
+                path: path.into(),
+                pool: OnceLock::new(),
+            }),
+        }
     }
 
     /// Database path.
     #[must_use]
     pub fn path(&self) -> &PathBuf {
-        &self.path
+        &self.inner.path
     }
 
-    /// Open a SQLite connection.
-    ///
-    /// # Errors
-    /// Returns an error when SQLite cannot open the database.
-    pub fn connect(&self) -> Result<Connection> {
-        if let Some(parent) = self.path.parent() {
+    fn pool(&self) -> Result<&Pool<SqliteConnectionManager>> {
+        if let Some(pool) = self.inner.pool.get() {
+            return Ok(pool);
+        }
+        let path = &self.inner.path;
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let conn = Connection::open(&self.path)
-            .with_context(|| format!("failed to open {}", self.path.display()))?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        Ok(conn)
+        let manager = SqliteConnectionManager::file(path).with_init(|conn| {
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+            Ok(())
+        });
+        let pool = Pool::builder()
+            .max_size(8)
+            .build(manager)
+            .with_context(|| format!("failed to build connection pool for {}", path.display()))?;
+        let _ = self.inner.pool.set(pool);
+        Ok(self.inner.pool.get().expect("pool was just initialized"))
+    }
+
+    /// Acquire a pooled SQLite connection.
+    ///
+    /// # Errors
+    /// Returns an error when SQLite cannot open the database or the pool is exhausted.
+    pub fn connect(&self) -> Result<PooledConn> {
+        let pool = self.pool()?;
+        pool.get().with_context(|| {
+            format!(
+                "failed to get connection from pool for {}",
+                self.inner.path.display()
+            )
+        })
     }
 
     /// Apply migrations.
@@ -277,6 +322,7 @@ impl Database {
         ensure_source_context_columns(&conn)?;
         ensure_feedback_columns(&conn)?;
         ensure_multi_branch_sessions(&mut conn)?;
+        ensure_patch_blob_column(&conn)?;
         Ok(())
     }
 
@@ -285,8 +331,9 @@ impl Database {
     /// # Errors
     /// Returns an error when reset or migration fails.
     pub fn reset(&self) -> Result<()> {
-        if self.path.exists() {
-            fs::remove_file(&self.path)?;
+        let path = self.inner.path.clone();
+        if path.exists() {
+            fs::remove_file(&path)?;
         }
         self.migrate()
     }
@@ -348,14 +395,34 @@ impl Database {
     /// # Errors
     /// Returns an error when git or SQLite fails.
     pub fn create_review_session(&self, input: NewReviewSession) -> Result<ReviewSessionRecord> {
+        let _span = info_span!(
+            "create_review_session",
+            repo_id = %input.repo_id,
+            base = %input.base_ref,
+            head = %input.head_ref,
+        )
+        .entered();
         let repo = self
             .repo(&input.repo_id)?
             .with_context(|| format!("repo not found: {}", input.repo_id))?;
         let git = GitRepo::open(&repo.path)?;
-        let base_sha = git.resolve_ref(&input.base_ref)?;
+        let base_sha = {
+            let _s = info_span!("resolve_refs").entered();
+            git.resolve_ref(&input.base_ref)?
+        };
         let head_sha = git.resolve_ref(&input.head_ref)?;
-        let commits = git.commits(&input.base_ref, &input.head_ref)?;
-        let files = git.diff_files(&input.base_ref, &input.head_ref)?;
+        let commits = {
+            let _s = info_span!("git_commits").entered();
+            git.commits(&input.base_ref, &input.head_ref)?
+        };
+        let files = {
+            let _s = info_span!("git_diff_files").entered();
+            git.diff_files(&input.base_ref, &input.head_ref)?
+        };
+        let file_count = files.len();
+        let blob_bytes: usize = files.iter().map(|f| f.patch_blob.len()).sum();
+        debug!(file_count, blob_bytes, "diff snapshot loaded");
+        let _persist_span = info_span!("persist_diff", file_count, blob_bytes).entered();
 
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -381,11 +448,13 @@ impl Database {
             ],
         )?;
 
-        for commit in commits {
-            tx.execute(
+        {
+            let mut commit_stmt = tx.prepare_cached(
                 "insert into commits(id, session_id, sha, short_sha, subject, body, author_name, author_email, authored_at)
                  values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
+            )?;
+            for commit in &commits {
+                commit_stmt.execute(params![
                     new_id(),
                     id,
                     commit.sha,
@@ -395,56 +464,26 @@ impl Database {
                     commit.author_name,
                     commit.author_email,
                     commit.authored_at
-                ],
-            )?;
+                ])?;
+            }
         }
 
-        for file in files {
-            let file_id = new_id();
-            tx.execute(
-                "insert into files(id, session_id, path, old_path, status, additions, deletions, review_state)
-                 values(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'unreviewed')",
-                params![
-                    file_id,
+        {
+            let mut file_stmt = tx.prepare_cached(
+                "insert into files(id, session_id, path, old_path, status, additions, deletions, review_state, patch_blob)
+                 values(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'unreviewed', ?8)",
+            )?;
+            for file in &files {
+                file_stmt.execute(params![
+                    new_id(),
                     id,
                     file.path,
                     file.old_path,
                     file.status,
                     file.additions,
-                    file.deletions
-                ],
-            )?;
-
-            for hunk in file.hunks {
-                let hunk_id = new_id();
-                tx.execute(
-                    "insert into hunks(id, file_id, old_start, old_lines, new_start, new_lines, patch)
-                     values(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        hunk_id,
-                        file_id,
-                        hunk.old_start,
-                        hunk.old_lines,
-                        hunk.new_start,
-                        hunk.new_lines,
-                        hunk.patch
-                    ],
-                )?;
-                for line in hunk.lines {
-                    tx.execute(
-                        "insert into diff_lines(id, hunk_id, file_path, old_line, new_line, line_kind, content)
-                         values(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        params![
-                            new_id(),
-                            hunk_id,
-                            file.path,
-                            line.old_line,
-                            line.new_line,
-                            line.line_kind,
-                            line.content
-                        ],
-                    )?;
-                }
+                    file.deletions,
+                    file.patch_blob,
+                ])?;
             }
         }
 
@@ -485,6 +524,7 @@ impl Database {
     /// # Errors
     /// Returns an error when git or SQLite fails, or the session does not exist.
     pub fn refresh_review_session(&self, session_id: &str) -> Result<ReviewSessionRecord> {
+        let _span = info_span!("refresh_review_session", session_id = %session_id).entered();
         let session = self
             .review_session(session_id)?
             .with_context(|| format!("review session not found: {session_id}"))?;
@@ -492,10 +532,23 @@ impl Database {
             .repo(&session.repo_id)?
             .with_context(|| format!("repo not found: {}", session.repo_id))?;
         let git = GitRepo::open(&repo.path)?;
-        let base_sha = git.resolve_ref(&session.base_ref)?;
+        let base_sha = {
+            let _s = info_span!("resolve_refs").entered();
+            git.resolve_ref(&session.base_ref)?
+        };
         let head_sha = git.resolve_ref(&session.head_ref)?;
-        let commits = git.commits(&session.base_ref, &session.head_ref)?;
-        let files = git.diff_files(&session.base_ref, &session.head_ref)?;
+        let commits = {
+            let _s = info_span!("git_commits").entered();
+            git.commits(&session.base_ref, &session.head_ref)?
+        };
+        let files = {
+            let _s = info_span!("git_diff_files").entered();
+            git.diff_files(&session.base_ref, &session.head_ref)?
+        };
+        let file_count = files.len();
+        let blob_bytes: usize = files.iter().map(|f| f.patch_blob.len()).sum();
+        debug!(file_count, blob_bytes, "diff snapshot loaded");
+        let _persist_span = info_span!("persist_diff", file_count, blob_bytes).entered();
 
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -541,11 +594,13 @@ impl Database {
             params![session_id],
         )?;
 
-        for commit in commits {
-            tx.execute(
+        {
+            let mut commit_stmt = tx.prepare_cached(
                 "insert into commits(id, session_id, sha, short_sha, subject, body, author_name, author_email, authored_at)
                  values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
+            )?;
+            for commit in &commits {
+                commit_stmt.execute(params![
                     new_id(),
                     session_id,
                     commit.sha,
@@ -555,109 +610,28 @@ impl Database {
                     commit.author_name,
                     commit.author_email,
                     commit.authored_at
-                ],
-            )?;
+                ])?;
+            }
         }
 
-        for file in files {
-            let file_id = new_id();
-            tx.execute(
-                "insert into files(id, session_id, path, old_path, status, additions, deletions, review_state)
-                 values(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'unreviewed')",
-                params![
-                    file_id,
+        {
+            let mut file_stmt = tx.prepare_cached(
+                "insert into files(id, session_id, path, old_path, status, additions, deletions, review_state, patch_blob)
+                 values(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'unreviewed', ?8)",
+            )?;
+            for file in &files {
+                file_stmt.execute(params![
+                    new_id(),
                     session_id,
                     file.path,
                     file.old_path,
                     file.status,
                     file.additions,
-                    file.deletions
-                ],
-            )?;
-            for hunk in file.hunks {
-                let hunk_id = new_id();
-                tx.execute(
-                    "insert into hunks(id, file_id, old_start, old_lines, new_start, new_lines, patch)
-                     values(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        hunk_id,
-                        file_id,
-                        hunk.old_start,
-                        hunk.old_lines,
-                        hunk.new_start,
-                        hunk.new_lines,
-                        hunk.patch
-                    ],
-                )?;
-                for line in hunk.lines {
-                    tx.execute(
-                        "insert into diff_lines(id, hunk_id, file_path, old_line, new_line, line_kind, content)
-                         values(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        params![
-                            new_id(),
-                            hunk_id,
-                            file.path,
-                            line.old_line,
-                            line.new_line,
-                            line.line_kind,
-                            line.content
-                        ],
-                    )?;
-                }
+                    file.deletions,
+                    file.patch_blob,
+                ])?;
             }
         }
-
-        let reanchor_comments = "update comments set diff_line_id = (
-              select dl.id from diff_lines dl
-              join hunks h on dl.hunk_id = h.id
-              join files f on h.file_id = f.id
-              where f.session_id = ?1
-                and dl.file_path = comments.file_path
-                and dl.old_line is comments.old_line
-                and dl.new_line is comments.new_line
-              limit 1
-            )
-            where session_id = ?1 and (old_line is not null or new_line is not null)";
-        tx.execute(reanchor_comments, params![session_id])?;
-
-        let reanchor_threads = "update review_threads set anchor_diff_line_id = (
-              select dl.id from diff_lines dl
-              join hunks h on dl.hunk_id = h.id
-              join files f on h.file_id = f.id
-              where f.session_id = ?1
-                and dl.file_path = review_threads.file_path
-                and dl.old_line is review_threads.old_line
-                and dl.new_line is review_threads.new_line
-              limit 1
-            )
-            where session_id = ?1 and (old_line is not null or new_line is not null)";
-        tx.execute(reanchor_threads, params![session_id])?;
-
-        let reanchor_notes = "update notes set source_diff_line_id = (
-              select dl.id from diff_lines dl
-              join hunks h on dl.hunk_id = h.id
-              join files f on h.file_id = f.id
-              where f.session_id = ?1
-                and dl.file_path = notes.source_file_path
-                and dl.old_line is notes.source_old_line
-                and dl.new_line is notes.source_new_line
-              limit 1
-            )
-            where session_id = ?1 and (source_old_line is not null or source_new_line is not null)";
-        tx.execute(reanchor_notes, params![session_id])?;
-
-        let reanchor_decisions = "update decisions set source_diff_line_id = (
-              select dl.id from diff_lines dl
-              join hunks h on dl.hunk_id = h.id
-              join files f on h.file_id = f.id
-              where f.session_id = ?1
-                and dl.file_path = decisions.source_file_path
-                and dl.old_line is decisions.source_old_line
-                and dl.new_line is decisions.source_new_line
-              limit 1
-            )
-            where session_id = ?1 and (source_old_line is not null or source_new_line is not null)";
-        tx.execute(reanchor_decisions, params![session_id])?;
 
         tx.execute(
             "update review_sessions set base_sha = ?1, head_sha = ?2, updated_at = ?3 where id = ?4",
@@ -743,7 +717,13 @@ impl Database {
                session_id = excluded.session_id,
                start_sha = excluded.start_sha,
                updated_at = excluded.updated_at",
-            params![session.repo_id, branch, session.id, session.head_sha, timestamp],
+            params![
+                session.repo_id,
+                branch,
+                session.id,
+                session.head_sha,
+                timestamp
+            ],
         )?;
         Ok(ActiveReviewSessionRecord {
             repo,
@@ -773,33 +753,34 @@ impl Database {
     ) -> Result<Option<ActiveReviewSessionRecord>> {
         let path = path.into().canonicalize()?.display().to_string();
         let conn = self.connect()?;
-        let row_to_record = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ActiveReviewSessionRecord> {
-            Ok(ActiveReviewSessionRecord {
-                repo: RepoRecord {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    path: row.get(2)?,
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
-                },
-                branch: row.get(17)?,
-                session: ReviewSessionRecord {
-                    id: row.get(5)?,
-                    repo_id: row.get(6)?,
-                    title: row.get(7)?,
-                    base_ref: row.get(8)?,
-                    head_ref: row.get(9)?,
-                    branch: row.get(10)?,
-                    base_sha: row.get(11)?,
-                    head_sha: row.get(12)?,
-                    status: row.get(13)?,
-                    created_at: row.get(14)?,
-                    updated_at: row.get(15)?,
-                },
-                start_sha: row.get(16)?,
-                updated_at: row.get(18)?,
-            })
-        };
+        let row_to_record =
+            |row: &rusqlite::Row<'_>| -> rusqlite::Result<ActiveReviewSessionRecord> {
+                Ok(ActiveReviewSessionRecord {
+                    repo: RepoRecord {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        path: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                    },
+                    branch: row.get(17)?,
+                    session: ReviewSessionRecord {
+                        id: row.get(5)?,
+                        repo_id: row.get(6)?,
+                        title: row.get(7)?,
+                        base_ref: row.get(8)?,
+                        head_ref: row.get(9)?,
+                        branch: row.get(10)?,
+                        base_sha: row.get(11)?,
+                        head_sha: row.get(12)?,
+                        status: row.get(13)?,
+                        created_at: row.get(14)?,
+                        updated_at: row.get(15)?,
+                    },
+                    start_sha: row.get(16)?,
+                    updated_at: row.get(18)?,
+                })
+            };
         let base_select = "select
                 r.id, r.name, r.path, r.created_at, r.updated_at,
                 rs.id, rs.repo_id, rs.title, rs.base_ref, rs.head_ref, rs.branch, rs.base_sha, rs.head_sha, rs.status, rs.created_at, rs.updated_at,
@@ -827,6 +808,178 @@ impl Database {
                 .optional()
                 .map_err(Into::into),
         }
+    }
+
+    /// Aggregated fleet-view overview: every active review across repos +
+    /// branches, with open + pending thread counts and live agent sessions.
+    ///
+    /// `idle_cutoff_seconds` filters agent sessions by `last_activity_at`.
+    /// Pass `i64::MAX` to disable filtering.
+    ///
+    /// # Errors
+    /// Returns an error when SQLite reads fail.
+    pub fn overview(&self, idle_cutoff_seconds: i64) -> Result<Vec<OverviewEntry>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "select
+                r.id, r.name, r.path, r.created_at, r.updated_at,
+                rs.id, rs.repo_id, rs.title, rs.base_ref, rs.head_ref, rs.branch, rs.base_sha, rs.head_sha, rs.status, rs.created_at, rs.updated_at,
+                ars.branch, ars.updated_at
+             from active_review_sessions ars
+             join repos r on r.id = ars.repo_id
+             join review_sessions rs on rs.id = ars.session_id
+             order by ars.updated_at desc",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                RepoRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                },
+                ReviewSessionRecord {
+                    id: row.get(5)?,
+                    repo_id: row.get(6)?,
+                    title: row.get(7)?,
+                    base_ref: row.get(8)?,
+                    head_ref: row.get(9)?,
+                    branch: row.get(10)?,
+                    base_sha: row.get(11)?,
+                    head_sha: row.get(12)?,
+                    status: row.get(13)?,
+                    created_at: row.get(14)?,
+                    updated_at: row.get(15)?,
+                },
+                row.get::<_, String>(16)?,
+                row.get::<_, String>(17)?,
+            ))
+        })?;
+        let entries: Vec<_> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let repo_ids: std::collections::HashSet<String> = entries
+            .iter()
+            .map(|(_, session, _, _)| session.repo_id.clone())
+            .collect();
+        let cutoff = if idle_cutoff_seconds == i64::MAX {
+            None
+        } else {
+            Some(
+                Utc::now()
+                    - chrono::Duration::try_seconds(idle_cutoff_seconds)
+                        .unwrap_or_else(chrono::Duration::zero),
+            )
+        };
+        let mut agents_by_key: std::collections::HashMap<
+            (String, String),
+            Vec<AgentSessionRecord>,
+        > = std::collections::HashMap::new();
+        if !repo_ids.is_empty() {
+            let repo_id_vec: Vec<String> = repo_ids.into_iter().collect();
+            let placeholders = (1..=repo_id_vec.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "select id, agent_session_id, agent_name, repo_id, branch,
+                        started_at, last_activity_at, ended_at
+                 from agent_sessions
+                 where repo_id in ({placeholders})
+                 order by last_activity_at desc"
+            );
+            let mut agent_stmt = conn.prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> = repo_id_vec
+                .iter()
+                .map(|s| s as &dyn rusqlite::ToSql)
+                .collect();
+            let agent_rows = agent_stmt.query_map(params.as_slice(), map_agent_session)?;
+            for row in agent_rows {
+                let record = row?;
+                if let Some(cutoff_dt) = cutoff
+                    && let Ok(parsed) =
+                        chrono::DateTime::parse_from_rfc3339(&record.last_activity_at)
+                    && parsed.with_timezone(&Utc) < cutoff_dt
+                {
+                    continue;
+                }
+                let Some(repo_id) = record.repo_id.clone() else {
+                    continue;
+                };
+                let Some(branch) = record.branch.clone() else {
+                    continue;
+                };
+                agents_by_key
+                    .entry((repo_id, branch))
+                    .or_default()
+                    .push(record);
+            }
+        }
+
+        let mut out = Vec::with_capacity(entries.len());
+        for (repo, session, branch, updated_at) in entries {
+            let open_thread_count: i64 = conn.query_row(
+                "select count(*) from review_threads
+                 where session_id = ?1 and status = 'open'",
+                [&session.id],
+                |row| row.get(0),
+            )?;
+            let pending_thread_count = self.pending_thread_count(&conn, &session.id)?;
+            let session_branch = session
+                .branch
+                .clone()
+                .unwrap_or_else(|| session.head_ref.clone());
+            let mut agent_sessions = agents_by_key
+                .remove(&(session.repo_id.clone(), session_branch))
+                .unwrap_or_default();
+            for record in &mut agent_sessions {
+                record.review_session_id = Some(session.id.clone());
+            }
+            out.push(OverviewEntry {
+                repo,
+                branch,
+                session,
+                open_thread_count,
+                pending_thread_count,
+                agent_sessions,
+                updated_at,
+            });
+        }
+        Ok(out)
+    }
+
+    fn pending_thread_count(&self, conn: &Connection, session_id: &str) -> Result<i64> {
+        let mut stmt = conn.prepare(
+            "select t.id, t.last_delivered_message_id,
+                    (select id from thread_messages m
+                       where m.thread_id = t.id and m.visibility != 'private'
+                       order by m.created_at desc, m.id desc limit 1) as latest_id,
+                    (select count(*) from thread_messages m
+                       where m.thread_id = t.id and m.visibility != 'private'
+                         and m.author_kind = 'human') as human_count
+             from review_threads t
+             where t.session_id = ?1 and t.status = 'open' and t.visibility = 'agent'",
+        )?;
+        let rows = stmt.query_map([session_id], |row| {
+            Ok((
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut count = 0;
+        for row in rows {
+            let (watermark, latest, human_count) = row?;
+            let pending = match (watermark.as_deref(), latest.as_deref()) {
+                (None, Some(_)) if human_count > 0 => true,
+                (Some(w), Some(l)) if w != l => true,
+                _ => false,
+            };
+            if pending {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// Register an agent session, resolving its repo by path when available.
@@ -1057,26 +1210,28 @@ impl Database {
         };
         let conn = self.connect()?;
         let id: Option<String> = conn
-            .query_row(
-                "select id from repos where path = ?1",
-                [canonical],
-                |row| row.get(0),
-            )
+            .query_row("select id from repos where path = ?1", [canonical], |row| {
+                row.get(0)
+            })
             .optional()?;
         Ok(id)
     }
 
-    /// Fetch diff files, hunks, and lines for a review session.
+    /// Fetch lightweight file summaries for a review session.
+    ///
+    /// Does not load `patch_blob` — use [`Database::review_diff_file`] per file
+    /// when the UI is ready to render that file's hunks.
     ///
     /// # Errors
     /// Returns an error when SQLite fails.
-    pub fn review_diff(&self, session_id: &str) -> Result<Vec<ReviewFileDiff>> {
+    pub fn review_diff_summary(&self, session_id: &str) -> Result<Vec<FileRecord>> {
+        let _span = info_span!("review_diff_summary", session_id = %session_id).entered();
         let conn = self.connect()?;
-        let mut file_stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "select id, session_id, path, old_path, status, additions, deletions, review_state
              from files where session_id = ?1 order by path",
         )?;
-        let file_rows = file_stmt.query_map([session_id], |row| {
+        let rows = stmt.query_map([session_id], |row| {
             Ok(FileRecord {
                 id: row.get(0)?,
                 session_id: row.get(1)?,
@@ -1088,47 +1243,103 @@ impl Database {
                 review_state: row.get(7)?,
             })
         })?;
-        let mut files = Vec::new();
-        for file in file_rows {
-            let file = file?;
-            let mut hunk_stmt = conn.prepare(
-                "select id, old_start, old_lines, new_start, new_lines, patch
-                 from hunks where file_id = ?1 order by rowid",
-            )?;
-            let hunk_rows = hunk_stmt.query_map([&file.id], |row| {
-                Ok(ReviewHunk {
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Fetch one file's parsed diff for a review session.
+    ///
+    /// Reads the file row + stored `patch_blob` and reparses on demand. Returns
+    /// `None` when the session has no row matching `file_path`.
+    ///
+    /// # Errors
+    /// Returns an error when SQLite fails.
+    pub fn review_diff_file(
+        &self,
+        session_id: &str,
+        file_path: &str,
+    ) -> Result<Option<ReviewFileDiff>> {
+        let _span = info_span!(
+            "review_diff_file",
+            session_id = %session_id,
+            file = %file_path,
+        )
+        .entered();
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare_cached(
+            "select id, session_id, path, old_path, status, additions, deletions, review_state, patch_blob
+             from files where session_id = ?1 and path = ?2 limit 1",
+        )?;
+        let row = stmt
+            .query_row(params![session_id, file_path], |row| {
+                let file = FileRecord {
                     id: row.get(0)?,
-                    old_start: row.get(1)?,
-                    old_lines: row.get(2)?,
-                    new_start: row.get(3)?,
-                    new_lines: row.get(4)?,
-                    patch: row.get(5)?,
-                    lines: Vec::new(),
-                })
-            })?;
-            let mut hunks = Vec::new();
-            for hunk in hunk_rows {
-                let mut hunk = hunk?;
-                let mut line_stmt = conn.prepare(
-                    "select id, file_path, old_line, new_line, line_kind, content
-                     from diff_lines where hunk_id = ?1 order by rowid",
-                )?;
-                let line_rows = line_stmt.query_map([&hunk.id], |row| {
-                    Ok(ReviewDiffLine {
-                        id: row.get(0)?,
-                        file_path: row.get(1)?,
-                        old_line: row.get(2)?,
-                        new_line: row.get(3)?,
-                        line_kind: row.get(4)?,
-                        content: row.get(5)?,
+                    session_id: row.get(1)?,
+                    path: row.get(2)?,
+                    old_path: row.get(3)?,
+                    status: row.get(4)?,
+                    additions: row.get(5)?,
+                    deletions: row.get(6)?,
+                    review_state: row.get(7)?,
+                };
+                let blob: Option<String> = row.get(8)?;
+                Ok((file, blob))
+            })
+            .optional()?;
+        let Some((file, blob)) = row else {
+            return Ok(None);
+        };
+        let hunks = blob
+            .as_deref()
+            .map(crate::git::parse_unified_diff)
+            .and_then(|parsed| parsed.into_iter().next())
+            .map(|df| {
+                df.hunks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(hi, h)| ReviewHunk {
+                        id: format!("{}#h{hi}", file.path),
+                        old_start: Some(h.old_start),
+                        old_lines: Some(h.old_lines),
+                        new_start: Some(h.new_start),
+                        new_lines: Some(h.new_lines),
+                        patch: h.patch,
+                        lines: h
+                            .lines
+                            .into_iter()
+                            .enumerate()
+                            .map(|(li, l)| ReviewDiffLine {
+                                id: format!("{}#h{hi}#l{li}", file.path),
+                                file_path: file.path.clone(),
+                                old_line: l.old_line,
+                                new_line: l.new_line,
+                                line_kind: l.line_kind,
+                                content: l.content,
+                            })
+                            .collect(),
                     })
-                })?;
-                hunk.lines = line_rows.collect::<rusqlite::Result<Vec<_>>>()?;
-                hunks.push(hunk);
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(Some(ReviewFileDiff { file, hunks }))
+    }
+
+    /// Fetch all diff files for a review session by reparsing each per-file
+    /// `patch_blob`. Prefer the summary + per-file APIs for interactive UI to
+    /// avoid loading every file at once.
+    ///
+    /// # Errors
+    /// Returns an error when SQLite fails.
+    pub fn review_diff(&self, session_id: &str) -> Result<Vec<ReviewFileDiff>> {
+        let _span = info_span!("review_diff_read", session_id = %session_id).entered();
+        let summary = self.review_diff_summary(session_id)?;
+        let mut out = Vec::with_capacity(summary.len());
+        for record in summary {
+            if let Some(diff) = self.review_diff_file(session_id, &record.path)? {
+                out.push(diff);
             }
-            files.push(ReviewFileDiff { file, hunks });
         }
-        Ok(files)
+        Ok(out)
     }
 
     /// Add a review comment.
@@ -1148,7 +1359,7 @@ impl Database {
                 id,
                 input.session_id,
                 input.file_path,
-                input.diff_line_id,
+                Option::<String>::None,
                 input.old_line,
                 input.new_line,
                 input.range_start_old_line,
@@ -1183,7 +1394,7 @@ impl Database {
                 id,
                 input.session_id,
                 input.file_path,
-                input.anchor_diff_line_id,
+                Option::<String>::None,
                 input.old_line,
                 input.new_line,
                 input.range_start_old_line,
@@ -1320,7 +1531,7 @@ impl Database {
                 input.status.unwrap_or_else(|| "draft".to_string()),
                 input.visibility.unwrap_or_else(|| "agent".to_string()),
                 source.map(|value| value.file_path.as_str()),
-                source.and_then(|value| value.diff_line_id.as_deref()),
+                Option::<String>::None,
                 source.and_then(|value| value.old_line),
                 source.and_then(|value| value.new_line),
                 source.and_then(|value| value.line_kind.as_deref()),
@@ -1356,7 +1567,7 @@ impl Database {
                 input.status.unwrap_or_else(|| "accepted".to_string()),
                 input.visibility.unwrap_or_else(|| "agent".to_string()),
                 source.map(|value| value.file_path.as_str()),
-                source.and_then(|value| value.diff_line_id.as_deref()),
+                Option::<String>::None,
                 source.and_then(|value| value.old_line),
                 source.and_then(|value| value.new_line),
                 source.and_then(|value| value.line_kind.as_deref()),
@@ -1550,7 +1761,8 @@ impl Database {
             .review_session(session_id)?
             .with_context(|| format!("session not found: {session_id}"))?;
         let threads = self.review_threads(session_id)?;
-        let watermarks = thread_watermarks(&self.connect()?, session_id)?;
+        let conn = self.connect()?;
+        let watermarks = thread_watermarks(&conn, session_id)?;
         let mut snapshots = Vec::new();
         for thread in &threads {
             if thread.status != "open" {
@@ -1705,7 +1917,7 @@ impl Database {
     ///
     /// # Errors
     /// Returns an error when SQLite cannot open the database.
-    pub fn export_connection(&self) -> Result<Connection> {
+    pub fn export_connection(&self) -> Result<PooledConn> {
         self.connect()
     }
 }
@@ -1903,6 +2115,15 @@ fn rebuild_active_review_sessions(conn: &mut Connection) -> Result<()> {
     )?;
     tx.commit()?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    Ok(())
+}
+
+fn ensure_patch_blob_column(conn: &Connection) -> Result<()> {
+    ensure_column(conn, "files", "patch_blob", "text")?;
+    conn.execute(
+        "insert or ignore into schema_migrations(version, applied_at) values(4, ?1)",
+        [now()],
+    )?;
     Ok(())
 }
 
@@ -2286,8 +2507,8 @@ fn short_sha(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        Database, NewComment, NewDecision, NewFixImport, NewNote, NewRepo, NewReviewSession,
-        NewReviewThread, SourceContext,
+        Database, NewAgentSession, NewComment, NewDecision, NewFixImport, NewNote, NewRepo,
+        NewReviewSession, NewReviewThread, SourceContext,
     };
     use anyhow::Result;
     use std::process::Command;
@@ -2450,7 +2671,10 @@ mod tests {
             repo_path: Some(repo_dir.display().to_string()),
             branch: Some("feature".to_string()),
         })?;
-        assert_eq!(agent.review_session_id.as_deref(), Some(session.id.as_str()));
+        assert_eq!(
+            agent.review_session_id.as_deref(),
+            Some(session.id.as_str())
+        );
         assert_eq!(agent.repo_id.as_deref(), Some(repo.id.as_str()));
 
         // Idempotent: re-register same id keeps row id stable.
@@ -2494,10 +2718,194 @@ mod tests {
         assert_eq!(resolved.branch, "feature");
 
         // Wrong branch returns None.
-        let missing = db
-            .active_review_session_for_repo_path(repo_dir.display().to_string(), Some("nope"))?;
+        let missing =
+            db.active_review_session_for_repo_path(repo_dir.display().to_string(), Some("nope"))?;
         assert!(missing.is_none());
 
+        Ok(())
+    }
+
+    #[test]
+    fn add_review_thread_accepts_non_persistent_anchor_id() -> Result<()> {
+        let temp = tempdir()?;
+        let repo_dir = temp.path().join("repo");
+        std::fs::create_dir(&repo_dir)?;
+        run(&repo_dir, ["git", "init"])?;
+        run(
+            &repo_dir,
+            ["git", "config", "user.email", "test@example.com"],
+        )?;
+        run(&repo_dir, ["git", "config", "user.name", "Test User"])?;
+        std::fs::write(repo_dir.join("a.txt"), "one\n")?;
+        run(&repo_dir, ["git", "add", "."])?;
+        run(&repo_dir, ["git", "commit", "-m", "base"])?;
+        run(&repo_dir, ["git", "checkout", "-b", "feature"])?;
+        std::fs::write(repo_dir.join("a.txt"), "one\ntwo\n")?;
+        run(&repo_dir, ["git", "commit", "-am", "change"])?;
+
+        let db = Database::new(temp.path().join("diff.db"));
+        db.migrate()?;
+        let repo = db.upsert_repo(NewRepo {
+            name: "fixture".to_string(),
+            path: repo_dir.display().to_string(),
+        })?;
+        let session = db.create_review_session(NewReviewSession {
+            repo_id: repo.id,
+            title: "feature review".to_string(),
+            base_ref: "master".to_string(),
+            head_ref: "feature".to_string(),
+            branch: Some("feature".to_string()),
+        })?;
+
+        // Frontend sends synthetic line ids like "a.txt#h0#l0" that do not
+        // correspond to any diff_lines row. The insert must succeed and the
+        // stored anchor must be NULL.
+        let thread = db.add_review_thread(NewReviewThread {
+            session_id: session.id.clone(),
+            file_path: "a.txt".to_string(),
+            anchor_diff_line_id: Some("a.txt#h0#l0".to_string()),
+            old_line: None,
+            new_line: Some(2),
+            range_start_old_line: None,
+            range_start_new_line: Some(2),
+            range_end_old_line: None,
+            range_end_new_line: Some(2),
+            selected_text: Some("+two".to_string()),
+            status: None,
+            visibility: None,
+            message_type: "comment".to_string(),
+            body: "needs a check".to_string(),
+        })?;
+        assert!(thread.anchor_diff_line_id.is_none());
+        let threads = db.review_threads(&session.id)?;
+        assert_eq!(threads.len(), 1);
+        assert!(threads[0].anchor_diff_line_id.is_none());
+        assert_eq!(threads[0].new_line, Some(2));
+        Ok(())
+    }
+
+    /// Helper: build a session against a tiny fixture repo.
+    fn fixture_session(temp: &std::path::Path) -> Result<(Database, String)> {
+        let repo_dir = temp.join("repo");
+        std::fs::create_dir(&repo_dir)?;
+        run(&repo_dir, ["git", "init"])?;
+        run(
+            &repo_dir,
+            ["git", "config", "user.email", "test@example.com"],
+        )?;
+        run(&repo_dir, ["git", "config", "user.name", "Test User"])?;
+        std::fs::write(repo_dir.join("a.txt"), "one\n")?;
+        run(&repo_dir, ["git", "add", "."])?;
+        run(&repo_dir, ["git", "commit", "-m", "base"])?;
+        run(&repo_dir, ["git", "checkout", "-b", "feature"])?;
+        std::fs::write(repo_dir.join("a.txt"), "one\ntwo\n")?;
+        run(&repo_dir, ["git", "commit", "-am", "change"])?;
+        let db = Database::new(temp.join("diff.db"));
+        db.migrate()?;
+        let repo = db.upsert_repo(NewRepo {
+            name: "fixture".to_string(),
+            path: repo_dir.display().to_string(),
+        })?;
+        let session = db.create_review_session(NewReviewSession {
+            repo_id: repo.id,
+            title: "feature review".to_string(),
+            base_ref: "master".to_string(),
+            head_ref: "feature".to_string(),
+            branch: Some("feature".to_string()),
+        })?;
+        Ok((db, session.id))
+    }
+
+    #[test]
+    fn add_comment_with_synthetic_diff_line_id_persists_with_null_anchor() -> Result<()> {
+        let temp = tempdir()?;
+        let (db, session_id) = fixture_session(temp.path())?;
+        let id = db.add_comment(NewComment {
+            session_id: session_id.clone(),
+            file_path: "a.txt".to_string(),
+            diff_line_id: Some("a.txt#h0#l0".to_string()),
+            old_line: None,
+            new_line: Some(2),
+            range_start_old_line: None,
+            range_start_new_line: Some(2),
+            range_end_old_line: None,
+            range_end_new_line: Some(2),
+            selected_text: Some("+two".to_string()),
+            body: "needs a check".to_string(),
+            status: None,
+            visibility: None,
+        })?;
+        assert!(!id.is_empty());
+        let ctx = db.agent_context(&session_id)?;
+        assert_eq!(ctx.open_comments.len(), 1);
+        assert!(ctx.open_comments[0].diff_line_id.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn add_note_with_synthetic_source_diff_line_id_persists_with_null_anchor() -> Result<()> {
+        let temp = tempdir()?;
+        let (db, session_id) = fixture_session(temp.path())?;
+        db.add_note(NewNote {
+            repo_id: None,
+            session_id: Some(session_id.clone()),
+            title: "style".to_string(),
+            body: "prefer explicit review intent".to_string(),
+            note_type: "preference".to_string(),
+            status: None,
+            visibility: None,
+            source_context: Some(SourceContext {
+                file_path: "a.txt".to_string(),
+                diff_line_id: Some("a.txt#h0#l0".to_string()),
+                old_line: None,
+                new_line: Some(2),
+                line_kind: Some("add".to_string()),
+                content: Some("+two".to_string()),
+            }),
+        })?;
+        let ctx = db.agent_context(&session_id)?;
+        assert_eq!(ctx.agent_visible_notes.len(), 1);
+        let source = ctx.agent_visible_notes[0]
+            .source_context
+            .as_ref()
+            .expect("source context");
+        assert_eq!(source.file_path, "a.txt");
+        assert!(source.diff_line_id.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn add_decision_with_synthetic_source_diff_line_id_persists_with_null_anchor() -> Result<()> {
+        let temp = tempdir()?;
+        let (db, session_id) = fixture_session(temp.path())?;
+        db.add_decision(NewDecision {
+            repo_id: None,
+            session_id: Some(session_id.clone()),
+            title: "opaque names".to_string(),
+            context: "model drift".to_string(),
+            decision: "treat names as opaque".to_string(),
+            rationale: "provider-owned strings drift".to_string(),
+            alternatives: None,
+            consequences: None,
+            status: None,
+            visibility: None,
+            source_context: Some(SourceContext {
+                file_path: "a.txt".to_string(),
+                diff_line_id: Some("a.txt#h0#l0".to_string()),
+                old_line: None,
+                new_line: Some(2),
+                line_kind: Some("add".to_string()),
+                content: Some("+two".to_string()),
+            }),
+        })?;
+        let ctx = db.agent_context(&session_id)?;
+        assert_eq!(ctx.accepted_decisions.len(), 1);
+        let source = ctx.accepted_decisions[0]
+            .source_context
+            .as_ref()
+            .expect("source context");
+        assert_eq!(source.file_path, "a.txt");
+        assert!(source.diff_line_id.is_none());
         Ok(())
     }
 

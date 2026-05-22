@@ -15,3 +15,8 @@ tokio.workspace = true
 tower-http.workspace = true
 wyrd-diff-core.workspace = true
 wyrd-diff-mcp.workspace = true
+
+[dev-dependencies]
+http-body-util = "0.1.2"
+tempfile.workspace = true
+tower = { version = "0.5.1", features = ["util"] }
