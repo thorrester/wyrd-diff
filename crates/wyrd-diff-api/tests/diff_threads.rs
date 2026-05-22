@@ -202,6 +202,200 @@ async fn add_thread_with_synthetic_anchor_succeeds() {
     assert_eq!(messages[0]["body"], Value::String("needs a check".into()));
 }
 
+async fn create_thread(f: &Fixture, body: &str, new_line: i64) -> Value {
+    let payload = serde_json::json!({
+        "file_path": f.file_path,
+        "anchor_diff_line_id": format!("{}#h0#l0", f.file_path),
+        "old_line": null,
+        "new_line": new_line,
+        "range_start_old_line": null,
+        "range_start_new_line": new_line,
+        "range_end_old_line": null,
+        "range_end_new_line": new_line,
+        "selected_text": "+two",
+        "body": body,
+        "message_type": "comment",
+        "status": "open",
+        "visibility": "agent",
+    });
+    let req = auth(
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/review-sessions/{}/threads", f.session_id)),
+    )
+    .body(Body::from(payload.to_string()))
+    .unwrap();
+    let (status, body) = send(&f.router, req).await;
+    assert_eq!(status, StatusCode::OK, "create thread failed: {body}");
+    body["thread"].clone()
+}
+
+#[tokio::test]
+async fn delete_thread_removes_it_from_subsequent_listing() {
+    let f = make_fixture();
+    let thread = create_thread(&f, "needs a check", 2).await;
+    let thread_id = thread["id"].as_str().expect("thread id").to_string();
+
+    let list_req = auth(
+        Request::builder()
+            .method("GET")
+            .uri(format!("/api/review-sessions/{}/threads", f.session_id)),
+    )
+    .body(Body::empty())
+    .unwrap();
+    let (status, body) = send(&f.router, list_req).await;
+    assert_eq!(status, StatusCode::OK);
+    let threads_before = body["threads"].as_array().expect("threads array");
+    assert_eq!(threads_before.len(), 1, "expected one thread before delete");
+
+    let del_req = auth(
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/review-threads/{thread_id}")),
+    )
+    .body(Body::empty())
+    .unwrap();
+    let (status, body) = send(&f.router, del_req).await;
+    assert_eq!(status, StatusCode::OK, "delete failed: {body}");
+    assert_eq!(body["deleted"], Value::Bool(true));
+
+    let list_req2 = auth(
+        Request::builder()
+            .method("GET")
+            .uri(format!("/api/review-sessions/{}/threads", f.session_id)),
+    )
+    .body(Body::empty())
+    .unwrap();
+    let (status, body) = send(&f.router, list_req2).await;
+    assert_eq!(status, StatusCode::OK);
+    let threads_after = body["threads"].as_array().expect("threads array");
+    assert!(
+        threads_after.is_empty(),
+        "expected empty after delete; got: {threads_after:?}"
+    );
+}
+
+#[tokio::test]
+async fn delete_thread_idempotent_returns_false_on_second_call() {
+    let f = make_fixture();
+    let thread = create_thread(&f, "tmp", 2).await;
+    let thread_id = thread["id"].as_str().unwrap().to_string();
+
+    for expected in [true, false] {
+        let req = auth(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/review-threads/{thread_id}")),
+        )
+        .body(Body::empty())
+        .unwrap();
+        let (status, body) = send(&f.router, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["deleted"],
+            Value::Bool(expected),
+            "deleted flag mismatch for expected={expected}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delete_thread_requires_authorization() {
+    let f = make_fixture();
+    let thread = create_thread(&f, "tmp", 2).await;
+    let thread_id = thread["id"].as_str().unwrap().to_string();
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/review-threads/{thread_id}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = send(&f.router, req).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "missing auth must be rejected"
+    );
+
+    let list_req = auth(
+        Request::builder()
+            .method("GET")
+            .uri(format!("/api/review-sessions/{}/threads", f.session_id)),
+    )
+    .body(Body::empty())
+    .unwrap();
+    let (_, body) = send(&f.router, list_req).await;
+    assert_eq!(body["threads"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn thread_lifecycle_create_reply_resolve_reopen_delete() {
+    let f = make_fixture();
+    let thread = create_thread(&f, "first message", 2).await;
+    let thread_id = thread["id"].as_str().unwrap().to_string();
+
+    let reply = auth(
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/review-threads/{thread_id}/messages")),
+    )
+    .body(Body::from(
+        serde_json::json!({
+            "body": "agent ack",
+            "author_kind": "agent",
+            "message_type": "agent_response",
+        })
+        .to_string(),
+    ))
+    .unwrap();
+    let (status, _) = send(&f.router, reply).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let resolve = auth(
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/review-threads/{thread_id}/resolve")),
+    )
+    .body(Body::from("{}"))
+    .unwrap();
+    let (status, body) = send(&f.router, resolve).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["updated"], Value::Bool(true));
+
+    let reopen = auth(
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/review-threads/{thread_id}/reopen")),
+    )
+    .body(Body::from("{}"))
+    .unwrap();
+    let (status, body) = send(&f.router, reopen).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["updated"], Value::Bool(true));
+
+    let del = auth(
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/review-threads/{thread_id}")),
+    )
+    .body(Body::empty())
+    .unwrap();
+    let (status, body) = send(&f.router, del).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["deleted"], Value::Bool(true));
+
+    let list = auth(
+        Request::builder()
+            .method("GET")
+            .uri(format!("/api/review-sessions/{}/threads", f.session_id)),
+    )
+    .body(Body::empty())
+    .unwrap();
+    let (_, body) = send(&f.router, list).await;
+    assert!(body["threads"].as_array().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn refresh_then_diff_file_still_renders_with_unique_ids() {
     let f = make_fixture();

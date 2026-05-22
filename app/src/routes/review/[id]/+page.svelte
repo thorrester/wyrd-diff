@@ -26,6 +26,16 @@
     type ReviewDiffLine,
     type ReviewThreadRecord
   } from '$lib/api';
+  import {
+    isThreadPending,
+    isThreadAwaitingHuman,
+    lastAgentMessage,
+    threadLineLabel,
+    threadAnchorLabel,
+    messageTypeLabel,
+    lineAnchorKey,
+    groupThreadsByLine
+  } from '$lib/threads';
 
   hljs.registerLanguage('bash', bash);
   hljs.registerLanguage('css', css);
@@ -59,12 +69,13 @@
   let message = '';
   let filter = '';
   let onlyAgentReplies = false;
+  let pendingDeleteThreadId: string | null = null;
   let leftWidth = 300;
   let filesHidden = false;
   let sessionBarHeight = 0;
-  const collapsed = new Set<string>();
-  const skipped = new Set<string>();
-  const revealedLarge = new Set<string>();
+  let collapsed = new Set<string>();
+  let skipped = new Set<string>();
+  let revealedLarge = new Set<string>();
   const largeChangeThreshold = 500;
   let lastBatch: FeedbackBatch | null = null;
   let dispatching = false;
@@ -206,31 +217,10 @@
   $: selectedLines = getSelectedRangeLines(files, selected, rangeStart, rangeEnd);
   $: selectedLineIds = new Set(selectedLines.map((line) => line.id));
   $: selectionLabel = formatRangeLabel(selectedLines);
-  $: visibleThreads = onlyAgentReplies ? threads.filter(isThreadAwaitingHuman) : threads;
-  $: threadsByLine = groupThreadsByLine(visibleThreads);
+  $: threadsByLine = groupThreadsByLine(threads);
   $: pendingThreadCount = threads.filter(isThreadPending).length;
   $: agentReplyThreadCount = threads.filter(isThreadAwaitingHuman).length;
   $: awaitingHumanThreads = threads.filter(isThreadAwaitingHuman);
-
-  function isThreadPending(thread: ReviewThreadRecord) {
-    if (thread.status !== 'open') return false;
-    const visible = thread.messages.filter((message) => message.visibility !== 'private');
-    if (visible.length === 0) return false;
-    const watermark = thread.last_delivered_message_id;
-    if (!watermark) {
-      return visible.some((message) => message.author_kind === 'human');
-    }
-    const index = visible.findIndex((message) => message.id === watermark);
-    if (index < 0) return visible.some((message) => message.author_kind === 'human');
-    return visible.slice(index + 1).some((message) => message.author_kind === 'human');
-  }
-
-  function isThreadAwaitingHuman(thread: ReviewThreadRecord) {
-    if (thread.status !== 'open') return false;
-    const visible = thread.messages.filter((message) => message.visibility !== 'private');
-    if (visible.length === 0) return false;
-    return visible[visible.length - 1].author_kind !== 'human';
-  }
 
   let routeController: AbortController | null = null;
   let loadGeneration = 0;
@@ -554,47 +544,21 @@
     document.getElementById('inline-thread-body')?.focus();
   }
 
-  function lineAnchorKey(filePath: string, oldLine: number | null, newLine: number | null): string {
-    return `${filePath}|${oldLine ?? ''}|${newLine ?? ''}`;
-  }
-
-  function groupThreadsByLine(items: ReviewThreadRecord[]) {
-    const map = new Map<string, ReviewThreadRecord[]>();
-    for (const thread of items) {
-      const key = lineAnchorKey(thread.file_path, thread.old_line, thread.new_line);
-      const list = map.get(key);
-      if (list) list.push(thread);
-      else map.set(key, [thread]);
-    }
-    return map;
-  }
-
-  function lastAgentMessage(thread: ReviewThreadRecord) {
-    const visible = thread.messages.filter((message) => message.visibility !== 'private');
-    for (let i = visible.length - 1; i >= 0; i -= 1) {
-      if (visible[i].author_kind !== 'human') return visible[i];
-    }
-    return null;
-  }
-
-  function threadLineLabel(thread: ReviewThreadRecord) {
-    const start =
-      thread.range_start_new_line ??
-      thread.new_line ??
-      thread.range_start_old_line ??
-      thread.old_line;
-    const end = thread.range_end_new_line ?? thread.range_end_old_line ?? start;
-    if (start == null) return '';
-    if (end != null && end !== start) return `:${start}-${end}`;
-    return `:${start}`;
-  }
-
   function jumpToThread(thread: ReviewThreadRecord) {
     const owning = files.find((item) => item.file.path === thread.file_path);
     if (owning) {
-      skipped.delete(owning.file.id);
-      collapsed.delete(owning.file.id);
-      if (isLargeFile(owning)) revealedLarge.add(owning.file.id);
+      if (skipped.has(owning.file.id)) {
+        skipped.delete(owning.file.id);
+        skipped = new Set(skipped);
+      }
+      if (collapsed.has(owning.file.id)) {
+        collapsed.delete(owning.file.id);
+        collapsed = new Set(collapsed);
+      }
+      if (isLargeFile(owning) && !revealedLarge.has(owning.file.id)) {
+        revealedLarge.add(owning.file.id);
+        revealedLarge = new Set(revealedLarge);
+      }
       files = files;
       ensureFileLoadedById(owning.file.id);
     }
@@ -619,13 +583,6 @@
       });
     };
     attempt(20);
-  }
-
-  function messageTypeLabel(type: string) {
-    return type
-      .split('_')
-      .map((part) => part.slice(0, 1).toUpperCase() + part.slice(1))
-      .join(' ');
   }
 
   async function createThread() {
@@ -664,10 +621,18 @@
   }
 
   async function deleteThread(thread: ReviewThreadRecord) {
-    if (!confirm('Delete this thread and all its messages?')) return;
     await api(`/api/review-threads/${thread.id}`, { method: 'DELETE' });
     threads = threads.filter((item) => item.id !== thread.id);
     if (activeThreadId === thread.id) activeThreadId = null;
+    pendingDeleteThreadId = null;
+  }
+
+  function requestDeleteThread(thread: ReviewThreadRecord) {
+    pendingDeleteThreadId = thread.id;
+  }
+
+  function cancelDeleteThread() {
+    pendingDeleteThreadId = null;
   }
 
   async function resolveThread(thread: ReviewThreadRecord) {
@@ -768,12 +733,6 @@
 
   function threadById(id: string): ReviewThreadRecord | undefined {
     return threads.find((thread) => thread.id === id);
-  }
-
-  function threadAnchorLabel(thread: ReviewThreadRecord | undefined): string {
-    if (!thread) return '';
-    const line = thread.new_line ?? thread.old_line;
-    return line == null ? thread.file_path : `${thread.file_path}:${line}`;
   }
 
   async function copyBatchThread(threadId: string, section: string) {
@@ -1273,12 +1232,27 @@
                                   on:click={() => reopenThread(thread)}>Reopen</button
                                 >
                               {/if}
-                              <button
-                                class="thread-delete"
-                                aria-label="Delete thread"
-                                title="Delete thread"
-                                on:click={() => deleteThread(thread)}>Delete</button
-                              >
+                              {#if pendingDeleteThreadId === thread.id}
+                                <button
+                                  class="thread-delete confirm"
+                                  aria-label="Confirm delete thread"
+                                  title="Confirm delete"
+                                  on:click={() => deleteThread(thread)}>Confirm delete</button
+                                >
+                                <button
+                                  class="thread-action"
+                                  aria-label="Cancel delete"
+                                  title="Cancel"
+                                  on:click={cancelDeleteThread}>Cancel</button
+                                >
+                              {:else}
+                                <button
+                                  class="thread-delete"
+                                  aria-label="Delete thread"
+                                  title="Delete thread"
+                                  on:click={() => requestDeleteThread(thread)}>Delete</button
+                                >
+                              {/if}
                             </div>
                             {#each thread.messages as threadMessage (threadMessage.id)}
                               <article
@@ -2410,6 +2384,12 @@
 
   .thread-delete {
     color: var(--wm-red);
+  }
+
+  .thread-delete.confirm {
+    background: var(--wm-red);
+    color: var(--wm-bg);
+    border-color: var(--wm-red);
   }
 
   .thread-meta .thread-action ~ .thread-delete {

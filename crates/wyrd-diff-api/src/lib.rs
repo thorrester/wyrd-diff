@@ -6,15 +6,19 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{delete, get, post},
 };
+use futures_util::stream;
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc};
+use std::{convert::Infallible, net::SocketAddr, sync::Arc};
 use tower_http::cors::CorsLayer;
 use wyrd_diff_core::{
-    Database, NewComment, NewDecision, NewFixImport, NewNote, NewRepo, NewReviewSession,
-    NewReviewThread, NewThreadMessage,
+    Database, NewDecision, NewFixImport, NewNote, NewRepo, NewReviewSession, NewReviewThread,
+    NewThreadMessage,
 };
 
 /// Shared API state.
@@ -138,7 +142,6 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/review-threads/:id/messages", post(add_thread_message))
         .route("/api/review-threads/:id/resolve", post(resolve_thread))
         .route("/api/review-threads/:id/reopen", post(reopen_thread))
-        .route("/api/review-sessions/:id/comments", post(add_comment))
         .route("/api/review-sessions/:id/notes", post(add_note))
         .route("/api/review-sessions/:id/decisions", post(add_decision))
         .route(
@@ -162,7 +165,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/repo-scan", get(repo_scan))
         .route("/api/repo-branches", get(repo_branches))
         .route("/api/export/trajectory.jsonl", get(export_trajectory))
-        .route("/mcp", post(mcp_endpoint).get(mcp_get))
+        .route("/mcp", post(mcp_endpoint).get(mcp_get).delete(mcp_delete))
         .route("/api/configure-agents", post(configure_agents_endpoint))
         .route("/api/configure-agents/:id", post(configure_agent_endpoint))
         .route("/api/status", get(status))
@@ -274,27 +277,74 @@ async fn configure_agent_endpoint(
 
 async fn mcp_endpoint(
     State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
     Json(request): Json<serde_json::Value>,
 ) -> Response {
+    let is_initialize =
+        request.get("method").and_then(serde_json::Value::as_str) == Some("initialize");
+    let is_notification = request.get("id").is_none()
+        && request
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .map(|m| m.starts_with("notifications/"))
+            .unwrap_or(false);
+    // Streamable HTTP: client sets Accept: application/json, text/event-stream.
+    // When SSE is accepted, wrap responses as SSE events so rmcp can parse them.
+    let wants_sse = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/event-stream"));
+
+    // Notifications require no response body. Return 202 per spec.
+    if is_notification {
+        return StatusCode::ACCEPTED.into_response();
+    }
+
     let db = state.db.clone();
     let result = tokio::task::spawn_blocking(move || wyrd_diff_mcp::dispatch(&db, request)).await;
-    match result {
-        Ok(Some(response)) => Json(response).into_response(),
-        // JSON-RPC notifications have no response, but Codex's bundled
-        // rmcp 0.15 client unconditionally `serde_json::from_slice`s the
-        // response body and chokes on an empty 202. Return 200 OK with an
-        // empty JSON object so the handshake completes.
-        Ok(None) => Json(serde_json::json!({})).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": error.to_string() })),
-        )
-            .into_response(),
+    let json_response = match result {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            // Non-notification with no result (edge case) — return 202.
+            return StatusCode::ACCEPTED.into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut response = if wants_sse {
+        // Wrap the JSON-RPC result in a single SSE `message` event.
+        let data = serde_json::to_string(&json_response).unwrap_or_default();
+        let event = Event::default().event("message").data(data);
+        Sse::new(stream::once(async move { Ok::<Event, Infallible>(event) })).into_response()
+    } else {
+        Json(json_response).into_response()
+    };
+
+    // Streamable HTTP requires Mcp-Session-Id in the initialize response so
+    // the client can tag subsequent requests. Single-user local tool; we
+    // generate a fresh UUID per initialize and do not track it server-side.
+    if is_initialize && let Ok(val) = uuid::Uuid::new_v4().to_string().parse() {
+        response.headers_mut().insert("mcp-session-id", val);
     }
+    response
 }
 
-async fn mcp_get() -> Response {
-    (StatusCode::METHOD_NOT_ALLOWED, "MCP requires POST").into_response()
+// GET /mcp — Streamable HTTP clients open a persistent SSE connection here
+// to receive server-initiated messages. Wyrd Diff never sends server-
+// initiated events; the stream stays open but never yields.
+async fn mcp_get() -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    Sse::new(stream::pending()).keep_alive(KeepAlive::default())
+}
+
+// DELETE /mcp — session termination per Streamable HTTP spec. Stateless here.
+async fn mcp_delete() -> StatusCode {
+    StatusCode::OK
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -392,19 +442,6 @@ async fn refresh_review_session(
     let db = state.db.clone();
     let session = run_blocking(move || db.refresh_review_session(&id)).await?;
     Ok(Json(serde_json::json!({ "review_session": session })))
-}
-
-async fn add_comment(
-    State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(mut input): Json<NewComment>,
-) -> ApiResult<Json<serde_json::Value>> {
-    authorize(&state, &headers)?;
-    input.session_id = id;
-    let db = state.db.clone();
-    let comment_id = run_blocking(move || db.add_comment(input)).await?;
-    Ok(Json(serde_json::json!({ "id": comment_id })))
 }
 
 async fn review_threads(

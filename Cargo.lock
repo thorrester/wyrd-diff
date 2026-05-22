@@ -4858,10 +4858,11 @@ dependencies = [
 
 [[package]]
 name = "wyrd-diff-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
+ "futures-util",
  "http-body-util",
  "serde",
  "serde_json",
@@ -4869,13 +4870,14 @@ dependencies = [
  "tokio",
  "tower",
  "tower-http",
+ "uuid",
  "wyrd-diff-core",
  "wyrd-diff-mcp",
 ]
 
 [[package]]
 name = "wyrd-diff-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -4886,7 +4888,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-diff-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4906,7 +4908,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-diff-mcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -4916,7 +4918,7 @@ dependencies = [
 
 [[package]]
 name = "wyrd-diff-tauri"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde_json",

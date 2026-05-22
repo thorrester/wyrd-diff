@@ -105,23 +105,6 @@ export type SourceContext = {
   content: string | null;
 };
 
-export type CommentRecord = {
-  id: string;
-  session_id: string;
-  file_path: string;
-  diff_line_id: string | null;
-  old_line: number | null;
-  new_line: number | null;
-  range_start_old_line: number | null;
-  range_start_new_line: number | null;
-  range_end_old_line: number | null;
-  range_end_new_line: number | null;
-  selected_text: string | null;
-  body: string;
-  status: string;
-  visibility: string;
-};
-
 export type ThreadMessageRecord = {
   id: string;
   thread_id: string;
@@ -221,7 +204,6 @@ export type AgentContext = {
     path: string;
   };
   session: ReviewSession;
-  open_comments: CommentRecord[];
   open_threads: ReviewThreadRecord[];
   accepted_decisions: DecisionRecord[];
   agent_visible_notes: NoteRecord[];
