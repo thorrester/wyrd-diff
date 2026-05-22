@@ -1,5 +1,7 @@
 # wyrd-diff
 
+Keep diffs wyrd
+
 A local diff review tool that pipes your review back to the coding agent while it's still working. Comment on the diff, dispatch the batch, the agent picks it up on its next turn through MCP and applies fixes. No PR round-trip. No copy-paste into chat.
 
 ## The problem
@@ -105,47 +107,58 @@ The status pill detects installed harnesses and shows a "Wire" button per harnes
 mise run configure:agents
 ```
 
-### Custom harness via TOML
+### User config (`wyrd-diff.toml`)
 
-Drop this in `~/.config/wyrd-diff/harnesses.toml`:
+The app reads `~/.config/wyrd-diff/wyrd-diff.toml` (honors `$XDG_CONFIG_HOME`). One file covers the repo home directory and any custom harnesses:
 
 ```toml
+home_dir = "~/Documents/GitHub"
+
 [[harness]]
 id = "my-harness"
 display = "My Harness"
 binary = "my-harness"
-config_path = "~/.my-harness/mcp.json"
+path = "~/.my-harness/mcp.json"
 format = "claude-json"
 ```
 
-Supported formats: `claude-json`, `codex-toml`, `opencode-json`, `gemini-json`. User entries override built-ins on id collision. Path expansion handles `~/`, `~`, `$HOME/`, and absolute paths.
+`home_dir` is where the composer scans for repos and is also writable from the app's home bar (it auto-detects `Documents/GitHub`, `github`, `code`, `src`, etc. on first launch). Legacy `harnesses.toml` in the same directory is still read when `wyrd-diff.toml` is absent.
+
+Supported harness formats: `claude-json`, `codex-toml`, `opencode-json`, `gemini-json`. User entries override built-ins on id collision. Path expansion handles `~/`, `~`, `$HOME/`, and absolute paths.
 
 If config writing fails (permissions, unfamiliar schema), the app falls back to a copy-pasteable snippet for the harness format.
 
-## Trajectory recording (optional)
+## Session + trajectory hooks (optional but recommended)
 
-If you also want to capture which fixes landed and which were rejected, wire the Stop hook. It's inert unless a review session is active, so leaving it on is safe.
+Wyrd diff supports multiple repos, branches, and live agent sessions in parallel. To link a coding agent to the right review automatically, wire two hooks: `SessionStart` registers the agent against its `(repo, branch)`, and `Stop` records the resulting commit + response as a trajectory point. Both hooks are inert when no active review exists for the branch, so leaving them on is safe.
 
-Set the session env vars before the agent runs:
+Pass two env vars when the hook fires:
+
+| Var | Value |
+| --- | --- |
+| `WYRD_DIFF_AGENT` | `claude`, `codex`, `opencode`, `gemini`, or your own name |
+| `WYRD_DIFF_AGENT_SESSION_ID` | The harness session id (`$CLAUDE_SESSION_ID`, `$CODEX_SESSION_ID`, etc.) |
+
+The CLI infers `repo_path` from `git rev-parse --show-toplevel` and `branch` from `git rev-parse --abbrev-ref HEAD`. Override either with `WYRD_DIFF_REPO_PATH` / `WYRD_DIFF_BRANCH` if your harness runs outside the repo root.
+
+Hook commands:
 
 ```bash
-export WYRD_DIFF_SESSION_ID="<review_session_id>"
-export WYRD_DIFF_START_SHA="$(git rev-parse HEAD)"
-export WYRD_DIFF_AGENT="codex"
-```
+# SessionStart
+cargo run --manifest-path /path/to/wyrd-diff/Cargo.toml --locked -p wyrd-diff-cli -- hook agent-start
 
-Point the harness's Stop hook at the CLI:
-
-```bash
+# Stop
 cargo run --manifest-path /path/to/wyrd-diff/Cargo.toml --locked -p wyrd-diff-cli -- hook agent-stop
 ```
 
 Example configs:
 
-- `examples/codex-hooks.json`
 - `examples/claude-settings.local.json`
+- `examples/codex-hooks.json`
 
-For Claude Code, put the hook in `.claude/settings.local.json`. For Codex, `.codex/hooks.json`. Both go in the target repo. Do not commit them. They contain machine-specific paths and live session IDs.
+For Claude Code, put the hook in `.claude/settings.local.json`. For Codex, `.codex/hooks.json`. Both go in the target repo. Do not commit them — they contain machine-specific paths.
+
+Once registered, agents can call `wyrd_diff.pending_feedback` with `{ agent_session_id, agent_name }` and the MCP server resolves the linked review automatically. No more hand-pasting session ids.
 
 ## Development
 

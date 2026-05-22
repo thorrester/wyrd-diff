@@ -52,9 +52,38 @@ export type ReviewSession = {
   title: string;
   base_ref: string;
   head_ref: string;
+  branch: string | null;
   base_sha: string;
   head_sha: string;
   status: string;
+};
+
+export type RepoRecord = {
+  id: string;
+  name: string;
+  path: string;
+};
+
+export type AgentSessionRecord = {
+  id: string;
+  agent_session_id: string;
+  agent_name: string;
+  repo_id: string | null;
+  branch: string | null;
+  review_session_id: string | null;
+  started_at: string;
+  last_activity_at: string;
+  ended_at: string | null;
+};
+
+export type OverviewEntry = {
+  repo: RepoRecord;
+  branch: string;
+  session: ReviewSession;
+  open_thread_count: number;
+  pending_thread_count: number;
+  agent_sessions: AgentSessionRecord[];
+  updated_at: string;
 };
 
 export type ReviewDiffLine = {
@@ -203,38 +232,91 @@ export type ReviewHunk = {
   lines: ReviewDiffLine[];
 };
 
+export type ReviewFileSummary = {
+  id: string;
+  session_id: string;
+  path: string;
+  old_path: string | null;
+  status: string;
+  additions: number;
+  deletions: number;
+  review_state: string;
+};
+
 export type ReviewFile = {
-  file: {
-    id: string;
-    path: string;
-    old_path: string | null;
-    status: string;
-    additions: number;
-    deletions: number;
-    review_state: string;
-  };
+  file: ReviewFileSummary;
   hunks: ReviewHunk[];
 };
 
 type RequestOptions = {
   method?: string;
   body?: unknown;
+  signal?: AbortSignal;
+  timeoutMs?: number;
 };
+
+export class ApiAbortError extends Error {
+  constructor(message = 'request aborted') {
+    super(message);
+    this.name = 'ApiAbortError';
+  }
+}
+
+export class ApiTimeoutError extends Error {
+  constructor(public timeoutMs: number) {
+    super(`request timed out after ${timeoutMs}ms`);
+    this.name = 'ApiTimeoutError';
+  }
+}
+
+function linkSignals(external: AbortSignal | undefined, timeoutMs: number | undefined) {
+  if (!external && !timeoutMs) return { signal: undefined as AbortSignal | undefined, cleanup: () => {} };
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const onExternalAbort = () => controller.abort(external?.reason);
+  if (external) {
+    if (external.aborted) controller.abort(external.reason);
+    else external.addEventListener('abort', onExternalAbort, { once: true });
+  }
+  if (timeoutMs && timeoutMs > 0) {
+    timer = setTimeout(() => controller.abort(new ApiTimeoutError(timeoutMs)), timeoutMs);
+  }
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      if (timer) clearTimeout(timer);
+      if (external) external.removeEventListener('abort', onExternalAbort);
+    }
+  };
+}
 
 export async function api<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const base = await ensureApiBase();
-  const response = await fetch(`${base}${path}`, {
-    method: options.method ?? 'GET',
-    headers: {
-      authorization: `Bearer ${token}`,
-      'content-type': 'application/json'
-    },
-    body: options.body === undefined ? undefined : JSON.stringify(options.body)
-  });
-  if (!response.ok) {
-    throw new Error(await response.text());
+  const { signal, cleanup } = linkSignals(options.signal, options.timeoutMs);
+  try {
+    const response = await fetch(`${base}${path}`, {
+      method: options.method ?? 'GET',
+      headers: {
+        authorization: `Bearer ${token}`,
+        'content-type': 'application/json'
+      },
+      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      signal
+    });
+    if (!response.ok) {
+      throw new Error(await response.text());
+    }
+    return (await response.json()) as T;
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      const reason = signal?.reason;
+      if (reason instanceof ApiTimeoutError) throw reason;
+      throw new ApiAbortError(typeof reason === 'string' ? reason : 'request aborted');
+    }
+    throw err;
+  } finally {
+    cleanup();
   }
-  return response.json() as Promise<T>;
 }
 
 export type AgentConfigResult = {

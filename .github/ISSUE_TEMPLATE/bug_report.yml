@@ -1,0 +1,102 @@
+name: Bug report
+description: Something is broken in wyrd-diff.
+title: "[bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing. The more concrete, the faster it gets fixed.
+        Include a minimal repro if you can. Log lines beat prose.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong, in one or two sentences.
+      placeholder: Dispatch batch fires but the panel never opens.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps. Include CLI commands or UI clicks.
+      placeholder: |
+        1. wyrd-diff-cli serve
+        2. Open http://127.0.0.1:8765
+        3. Click "Dispatch batch (3)"
+        4. Nothing happens
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include error messages, panic traces, or HTTP responses verbatim.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where did it break?
+      multiple: true
+      options:
+        - Desktop app (Tauri)
+        - SvelteKit UI in browser
+        - CLI (wyrd-diff-cli)
+        - MCP server / agent harness
+        - Local HTTP API
+        - SQLite / migrations
+    validations:
+      required: true
+
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Agent harness (if relevant)
+      multiple: true
+      options:
+        - Claude Code
+        - Codex CLI
+        - OpenCode
+        - Gemini CLI
+        - Other / custom
+        - Not applicable
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: wyrd-diff version / commit
+      placeholder: "v0.1.0 or commit sha"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS + version
+      placeholder: macOS 15.1, Ubuntu 24.04, Windows 11
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: Paste relevant `RUST_LOG=debug` output, browser console errors, or hook stderr.
+      render: shell
+    validations:
+      required: false

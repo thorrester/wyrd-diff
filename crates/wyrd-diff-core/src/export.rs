@@ -46,7 +46,7 @@ pub fn agent_context(db: &Database, session_id: &str) -> Result<AgentContext> {
     let conn = db.export_connection()?;
     let session: ReviewSessionRecord = conn
         .query_row(
-            "select id, repo_id, title, base_ref, head_ref, base_sha, head_sha, status, created_at, updated_at
+            "select id, repo_id, title, base_ref, head_ref, branch, base_sha, head_sha, status, created_at, updated_at
              from review_sessions where id = ?1",
             [session_id],
             |row| {
@@ -56,11 +56,12 @@ pub fn agent_context(db: &Database, session_id: &str) -> Result<AgentContext> {
                     title: row.get(2)?,
                     base_ref: row.get(3)?,
                     head_ref: row.get(4)?,
-                    base_sha: row.get(5)?,
-                    head_sha: row.get(6)?,
-                    status: row.get(7)?,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
+                    branch: row.get(5)?,
+                    base_sha: row.get(6)?,
+                    head_sha: row.get(7)?,
+                    status: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
                 })
             },
         )
@@ -148,7 +149,7 @@ pub fn trajectory_records(db: &Database, repo_id: Option<&str>) -> Result<Vec<Tr
 
 fn session(conn: &rusqlite::Connection, id: &str) -> Result<ReviewSessionRecord> {
     conn.query_row(
-        "select id, repo_id, title, base_ref, head_ref, base_sha, head_sha, status, created_at, updated_at
+        "select id, repo_id, title, base_ref, head_ref, branch, base_sha, head_sha, status, created_at, updated_at
          from review_sessions where id = ?1",
         [id],
         |row| {
@@ -158,11 +159,12 @@ fn session(conn: &rusqlite::Connection, id: &str) -> Result<ReviewSessionRecord>
                 title: row.get(2)?,
                 base_ref: row.get(3)?,
                 head_ref: row.get(4)?,
-                base_sha: row.get(5)?,
-                head_sha: row.get(6)?,
-                status: row.get(7)?,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
+                branch: row.get(5)?,
+                base_sha: row.get(6)?,
+                head_sha: row.get(7)?,
+                status: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
             })
         },
     )

@@ -6,7 +6,9 @@
 //! file path and a [`HarnessFormat`]. The format drives read, write, and
 //! snippet generation. Built-in harnesses live in [`built_in_harnesses`].
 //! Users can add their own at
-//! `$XDG_CONFIG_HOME/wyrd-diff/harnesses.toml` (or `~/.config/wyrd-diff/...`).
+//! `$XDG_CONFIG_HOME/wyrd-diff/wyrd-diff.toml` (or
+//! `~/.config/wyrd-diff/wyrd-diff.toml`). Legacy `harnesses.toml` files at the
+//! same location are still read when `wyrd-diff.toml` is absent.
 //!
 //! ```toml
 //! [[harness]]
@@ -18,7 +20,7 @@
 //! ```
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     env, fs,
@@ -31,7 +33,7 @@ pub const DEFAULT_MCP_URL: &str = "http://127.0.0.1:8765/mcp";
 /// Server name used inside every harness's config.
 pub const SERVER_NAME: &str = "wyrd-diff";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HarnessFormat {
     /// `mcpServers.<name> = { type: "http", url }` (Claude Code).
@@ -93,17 +95,19 @@ pub struct HarnessWrite {
     pub action: ConfigAction,
 }
 
-#[derive(Debug, Deserialize)]
-struct CustomRegistryFile {
-    #[serde(default)]
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct ConfigFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    home_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     harness: Vec<CustomHarnessEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct CustomHarnessEntry {
     id: String,
     display: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     binary: Option<String>,
     path: String,
     format: HarnessFormat,
@@ -144,18 +148,75 @@ pub fn built_in_harnesses(home: &Path) -> Vec<Harness> {
     ]
 }
 
-/// Path to the user-defined harness registry file.
-pub fn user_registry_path(home: &Path) -> PathBuf {
-    user_registry_path_with(home, env::var_os("XDG_CONFIG_HOME").as_deref())
+const CONFIG_FILENAME: &str = "wyrd-diff.toml";
+const LEGACY_HARNESS_FILENAME: &str = "harnesses.toml";
+
+/// Path to the canonical user config file (`wyrd-diff.toml`).
+pub fn user_config_path(home: &Path) -> PathBuf {
+    user_config_path_with(home, env::var_os("XDG_CONFIG_HOME").as_deref())
 }
 
-fn user_registry_path_with(home: &Path, xdg: Option<&std::ffi::OsStr>) -> PathBuf {
+fn user_config_path_with(home: &Path, xdg: Option<&std::ffi::OsStr>) -> PathBuf {
     if let Some(xdg) = xdg.filter(|s| !s.is_empty()) {
-        return PathBuf::from(xdg).join("wyrd-diff").join("harnesses.toml");
+        return PathBuf::from(xdg).join("wyrd-diff").join(CONFIG_FILENAME);
+    }
+    home.join(".config").join("wyrd-diff").join(CONFIG_FILENAME)
+}
+
+/// Path to the legacy harness-only registry (`harnesses.toml`). Still read for
+/// backward compatibility when `wyrd-diff.toml` is absent.
+pub fn legacy_harness_path(home: &Path) -> PathBuf {
+    legacy_harness_path_with(home, env::var_os("XDG_CONFIG_HOME").as_deref())
+}
+
+fn legacy_harness_path_with(home: &Path, xdg: Option<&std::ffi::OsStr>) -> PathBuf {
+    if let Some(xdg) = xdg.filter(|s| !s.is_empty()) {
+        return PathBuf::from(xdg)
+            .join("wyrd-diff")
+            .join(LEGACY_HARNESS_FILENAME);
     }
     home.join(".config")
         .join("wyrd-diff")
-        .join("harnesses.toml")
+        .join(LEGACY_HARNESS_FILENAME)
+}
+
+/// Backwards-compatible alias for [`user_config_path`].
+#[deprecated = "use user_config_path (writes wyrd-diff.toml)"]
+pub fn user_registry_path(home: &Path) -> PathBuf {
+    user_config_path(home)
+}
+
+fn read_config_file(path: &Path) -> Result<ConfigFile> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn load_config_with(home: &Path, xdg: Option<&std::ffi::OsStr>) -> Result<ConfigFile> {
+    let canonical = user_config_path_with(home, xdg);
+    if canonical.exists() {
+        return read_config_file(&canonical);
+    }
+    let legacy = legacy_harness_path_with(home, xdg);
+    if legacy.exists() {
+        return read_config_file(&legacy);
+    }
+    Ok(ConfigFile::default())
+}
+
+fn write_config_with(
+    home: &Path,
+    xdg: Option<&std::ffi::OsStr>,
+    config: &ConfigFile,
+) -> Result<()> {
+    let path = user_config_path_with(home, xdg);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let body = toml::to_string_pretty(config).context("failed to serialize wyrd-diff.toml")?;
+    fs::write(&path, body).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
 }
 
 /// Load user-defined harnesses. Missing file is not an error.
@@ -167,15 +228,8 @@ pub fn user_harnesses(home: &Path) -> Result<Vec<Harness>> {
 }
 
 fn user_harnesses_with(home: &Path, xdg: Option<&std::ffi::OsStr>) -> Result<Vec<Harness>> {
-    let path = user_registry_path_with(home, xdg);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let text =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let parsed: CustomRegistryFile =
-        toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
-    parsed
+    let config = load_config_with(home, xdg)?;
+    config
         .harness
         .into_iter()
         .map(|entry| {
@@ -188,6 +242,135 @@ fn user_harnesses_with(home: &Path, xdg: Option<&std::ffi::OsStr>) -> Result<Vec
             })
         })
         .collect()
+}
+
+/// Resolved view of the `home_dir` setting, including whether the value came
+/// from disk or auto-detection.
+#[derive(Debug, Clone)]
+pub struct HomeDirView {
+    /// Saved or detected path. `None` when neither is available.
+    pub home_dir: Option<String>,
+    /// True when `home_dir` was inferred via [`detect_home_dir`].
+    pub inferred: bool,
+}
+
+/// Return the saved `home_dir` from `wyrd-diff.toml`, if present.
+///
+/// # Errors
+/// Returns an error when the config file exists but cannot be parsed.
+pub fn home_dir(home: &Path) -> Result<Option<String>> {
+    home_dir_with(home, env::var_os("XDG_CONFIG_HOME").as_deref())
+}
+
+fn home_dir_with(home: &Path, xdg: Option<&std::ffi::OsStr>) -> Result<Option<String>> {
+    Ok(load_config_with(home, xdg)?.home_dir)
+}
+
+/// Saved value, or first existing candidate from [`detect_home_dir`].
+///
+/// # Errors
+/// Returns an error when the config file exists but cannot be parsed.
+pub fn home_dir_view(home: &Path) -> Result<HomeDirView> {
+    if let Some(saved) = home_dir(home)? {
+        return Ok(HomeDirView {
+            home_dir: Some(saved),
+            inferred: false,
+        });
+    }
+    Ok(HomeDirView {
+        home_dir: detect_home_dir(home),
+        inferred: true,
+    })
+}
+
+/// Update `home_dir` in `wyrd-diff.toml`, preserving any existing harnesses.
+///
+/// # Errors
+/// Returns an error when reading the existing config or writing the new file
+/// fails.
+pub fn set_home_dir(home: &Path, value: &str) -> Result<()> {
+    set_home_dir_with(home, env::var_os("XDG_CONFIG_HOME").as_deref(), value)
+}
+
+fn set_home_dir_with(home: &Path, xdg: Option<&std::ffi::OsStr>, value: &str) -> Result<()> {
+    let mut config = load_config_with(home, xdg).unwrap_or_default();
+    config.home_dir = Some(value.to_string());
+    write_config_with(home, xdg, &config)
+}
+
+/// Probe common conventions for a top-level repositories directory.
+///
+/// Returns the first existing directory under `home`, in priority order. None
+/// when no candidate matches.
+#[must_use]
+pub fn detect_home_dir(home: &Path) -> Option<String> {
+    const CANDIDATES: &[&str] = &[
+        "Documents/GitHub",
+        "Documents/github",
+        "github",
+        "GitHub",
+        "code",
+        "Code",
+        "src",
+        "dev",
+        "projects",
+        "Projects",
+        "workspace",
+    ];
+    for relative in CANDIDATES {
+        let candidate = home.join(relative);
+        if candidate.is_dir() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+/// Expand a leading `~/`, `~`, or `$HOME/` against `home` and return a
+/// platform-string version of the path.
+#[must_use]
+pub fn expand_user_path_string(raw: &str, home: &Path) -> String {
+    expand_user_path(raw.trim(), home)
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Resolved view of `home_dir` for the active `$HOME`.
+///
+/// # Errors
+/// Returns an error when `$HOME` is unset or the config file cannot be parsed.
+pub fn home_dir_view_env() -> Result<HomeDirView> {
+    let home = resolve_env_home().context("failed to resolve home directory")?;
+    home_dir_view(&home)
+}
+
+/// Update `home_dir` in `wyrd-diff.toml` using the active `$HOME`.
+///
+/// # Errors
+/// Returns an error when `$HOME` is unset or the file write fails.
+pub fn set_home_dir_env(value: &str) -> Result<()> {
+    let home = resolve_env_home().context("failed to resolve home directory")?;
+    set_home_dir(&home, value)
+}
+
+/// Canonical config file path for the active `$HOME`.
+///
+/// # Errors
+/// Returns an error when `$HOME` is unset.
+pub fn user_config_path_env() -> Result<PathBuf> {
+    let home = resolve_env_home().context("failed to resolve home directory")?;
+    Ok(user_config_path(&home))
+}
+
+/// Expand `raw` against the active `$HOME`. Returns `raw` unchanged when
+/// `$HOME` is unset.
+#[must_use]
+pub fn expand_user_path_env(raw: &str) -> String {
+    if let Some(home) = resolve_env_home() {
+        expand_user_path_string(raw, &home)
+    } else {
+        raw.trim().to_string()
+    }
 }
 
 /// All known harnesses. User entries override built-ins on `id` collision.
@@ -216,7 +399,7 @@ fn known_harnesses_with(home: &Path, xdg: Option<&std::ffi::OsStr>) -> Result<Ve
 /// Returns an error when the home directory cannot be resolved or a config
 /// file cannot be read or parsed.
 pub fn agent_status(expected_url: &str) -> Result<Vec<HarnessReport>> {
-    let home = home_dir().context("failed to resolve home directory")?;
+    let home = resolve_env_home().context("failed to resolve home directory")?;
     let path_dirs = path_dirs();
     let harnesses = known_harnesses(&home)?;
     harnesses
@@ -232,7 +415,7 @@ pub fn agent_status(expected_url: &str) -> Result<Vec<HarnessReport>> {
 /// Returns an error when the home directory cannot be resolved, the user
 /// registry cannot be parsed, or any write fails.
 pub fn configure_agents(url: &str) -> Result<Vec<HarnessWrite>> {
-    let home = home_dir().context("failed to resolve home directory")?;
+    let home = resolve_env_home().context("failed to resolve home directory")?;
     let path_dirs = path_dirs();
     let harnesses = known_harnesses(&home)?;
     let mut out = Vec::new();
@@ -252,7 +435,7 @@ pub fn configure_agents(url: &str) -> Result<Vec<HarnessWrite>> {
 /// Returns an error when the home directory cannot be resolved, the harness
 /// id is unknown, or the write fails.
 pub fn configure_agent(id: &str, url: &str) -> Result<HarnessWrite> {
-    let home = home_dir().context("failed to resolve home directory")?;
+    let home = resolve_env_home().context("failed to resolve home directory")?;
     let harness = known_harnesses(&home)?
         .into_iter()
         .find(|h| h.id == id)
@@ -512,7 +695,7 @@ fn snippet_for(format: HarnessFormat, url: &str) -> String {
     }
 }
 
-fn home_dir() -> Option<PathBuf> {
+fn resolve_env_home() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from)
 }
 
@@ -650,14 +833,72 @@ format = "codex-toml"
     }
 
     #[test]
-    fn user_registry_path_respects_xdg() {
+    fn user_config_path_respects_xdg() {
         let home = Path::new("/home/u");
         let xdg = std::ffi::OsString::from("/tmp/xdg");
-        let path = user_registry_path_with(home, Some(xdg.as_os_str()));
-        assert_eq!(path, PathBuf::from("/tmp/xdg/wyrd-diff/harnesses.toml"));
-        let fallback = user_registry_path_with(home, None);
+        let path = user_config_path_with(home, Some(xdg.as_os_str()));
+        assert_eq!(path, PathBuf::from("/tmp/xdg/wyrd-diff/wyrd-diff.toml"));
+        let fallback = user_config_path_with(home, None);
         assert_eq!(
             fallback,
+            PathBuf::from("/home/u/.config/wyrd-diff/wyrd-diff.toml")
+        );
+    }
+
+    #[test]
+    fn set_home_dir_preserves_existing_harnesses() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let registry = home.join(".config").join("wyrd-diff");
+        fs::create_dir_all(&registry).unwrap();
+        let initial = r#"
+[[harness]]
+id = "pi"
+display = "Pi"
+binary = "pi"
+path = "~/.pi/mcp.json"
+format = "claude-json"
+"#;
+        fs::write(registry.join("wyrd-diff.toml"), initial).unwrap();
+
+        set_home_dir_with(home, None, "/tmp/repos").unwrap();
+
+        let written = fs::read_to_string(registry.join("wyrd-diff.toml")).unwrap();
+        assert!(written.contains("home_dir = \"/tmp/repos\""));
+        let list = user_harnesses_with(home, None).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "pi");
+    }
+
+    #[test]
+    fn load_falls_back_to_legacy_harnesses_file() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let registry = home.join(".config").join("wyrd-diff");
+        fs::create_dir_all(&registry).unwrap();
+        let content = r#"
+[[harness]]
+id = "legacy"
+display = "Legacy"
+path = "/abs/legacy.toml"
+format = "codex-toml"
+"#;
+        fs::write(registry.join("harnesses.toml"), content).unwrap();
+        let list = user_harnesses_with(home, None).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "legacy");
+    }
+
+    #[test]
+    fn legacy_harness_path_resolves_old_filename() {
+        let home = Path::new("/home/u");
+        let xdg = std::ffi::OsString::from("/tmp/xdg");
+        assert_eq!(
+            legacy_harness_path_with(home, Some(xdg.as_os_str())),
+            PathBuf::from("/tmp/xdg/wyrd-diff/harnesses.toml")
+        );
+        assert_eq!(
+            legacy_harness_path_with(home, None),
             PathBuf::from("/home/u/.config/wyrd-diff/harnesses.toml")
         );
     }

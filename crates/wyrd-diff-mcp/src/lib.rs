@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::{env, path::PathBuf, process::Command};
-use wyrd_diff_core::{Database, NewFixImport, NewRepo, NewReviewSession};
+use wyrd_diff_core::{Database, NewAgentSession, NewFixImport, NewRepo, NewReviewSession};
 
 /// Dispatch a single JSON-RPC request. Returns `None` for notifications.
 pub fn dispatch(db: &Database, request: Value) -> Option<Value> {
@@ -57,6 +57,7 @@ fn call_tool(db: &Database, params: Value) -> std::result::Result<Value, String>
         "wyrd_diff.open_review_session" => open_review_session(args),
         "wyrd_diff.get_agent_context" => get_agent_context(db, args),
         "wyrd_diff.get_open_comments" => get_open_comments(db, args),
+        "wyrd_diff.register_agent_session" => register_agent_session(db, args),
         "wyrd_diff.pending_feedback" => pending_feedback(db, args),
         "wyrd_diff.import_fix" => import_fix(db, args),
         "wyrd_diff.export_trajectory" => export_trajectory(db, args),
@@ -106,11 +107,16 @@ fn create_review_session(db: &Database, args: Value) -> Result<Value> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| format!("{base_ref}..{head_ref}"));
+    let branch = args
+        .get("branch")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let session = db.create_review_session(NewReviewSession {
         repo_id,
         title,
         base_ref: base_ref.to_string(),
         head_ref: head_ref.to_string(),
+        branch,
     })?;
     Ok(json!({
         "review_session": session,
@@ -146,9 +152,40 @@ fn get_open_comments(db: &Database, args: Value) -> Result<Value> {
     Ok(json!({ "open_comments": context.open_comments }))
 }
 
+fn register_agent_session(db: &Database, args: Value) -> Result<Value> {
+    let agent_session_id = required_str(&args, "agent_session_id")?.to_string();
+    let agent_name = args
+        .get("agent_name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let repo_path = args
+        .get("repo_path")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let branch = args
+        .get("branch")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let record = db.register_agent_session(NewAgentSession {
+        agent_session_id,
+        agent_name,
+        repo_path,
+        branch,
+    })?;
+    Ok(json!({ "agent_session": record }))
+}
+
 fn pending_feedback(db: &Database, args: Value) -> Result<Value> {
     let session_id = resolve_session_id(db, &args)?;
     let agent_session_id = args.get("agent_session_id").and_then(Value::as_str);
+    let agent_name = args
+        .get("agent_name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if let Some(id) = agent_session_id {
+        db.bump_agent_session_activity(id, agent_name)?;
+    }
     let batch = db.claim_pending_feedback(&session_id, agent_session_id)?;
     match batch {
         Some(batch) => Ok(json!({
@@ -214,14 +251,24 @@ fn resolve_session_id(db: &Database, args: &Value) -> Result<String> {
     if let Some(session_id) = args.get("session_id").and_then(Value::as_str) {
         return Ok(session_id.to_string());
     }
+    if let Some(agent_session_id) = args.get("agent_session_id").and_then(Value::as_str) {
+        let agent_name = args
+            .get("agent_name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if let Some(linked) = db.linked_review_session_for_agent(agent_session_id, agent_name)? {
+            return Ok(linked);
+        }
+    }
     if let Some(path) = args.get("repo_path").and_then(Value::as_str) {
+        let branch = args.get("branch").and_then(Value::as_str);
         let active = db
-            .active_review_session_for_repo_path(path)?
+            .active_review_session_for_repo_path(path, branch)?
             .with_context(|| format!("no active review session for repo: {path}"))?;
         return Ok(active.session.id);
     }
     Err(anyhow::anyhow!(
-        "missing required argument: session_id (or repo_path with an active session)"
+        "missing required argument: session_id (or agent_session_id + agent_name, or repo_path)"
     ))
 }
 
@@ -299,14 +346,30 @@ fn tools() -> Value {
             })
         ),
         tool(
+            "wyrd_diff.register_agent_session",
+            "Register or refresh an agent session by harness session id + agent name. Optionally bind to a repo_path and branch so subsequent pending_feedback calls can resolve the active review.",
+            json!({
+                "type": "object",
+                "required": ["agent_session_id"],
+                "properties": {
+                    "agent_session_id": { "type": "string" },
+                    "agent_name": { "type": "string" },
+                    "repo_path": { "type": "string" },
+                    "branch": { "type": "string" }
+                }
+            })
+        ),
+        tool(
             "wyrd_diff.pending_feedback",
-            "Claim the newest pending feedback batch for a session and mark it delivered. Returns markdown the reviewer queued; subsequent calls only return new replies past the watermark. Pass session_id, or repo_path to use that repo's active session.",
+            "Claim the newest pending feedback batch for a session and mark it delivered. Returns markdown the reviewer queued; subsequent calls only return new replies past the watermark. Resolution order: explicit session_id, then linked review for (agent_session_id, agent_name), then active review for (repo_path, branch).",
             json!({
                 "type": "object",
                 "properties": {
                     "session_id": { "type": "string" },
                     "repo_path": { "type": "string" },
-                    "agent_session_id": { "type": "string" }
+                    "branch": { "type": "string" },
+                    "agent_session_id": { "type": "string" },
+                    "agent_name": { "type": "string" }
                 }
             })
         ),

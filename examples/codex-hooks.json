@@ -1,8 +1,13 @@
 {
   "hooks": [
     {
+      "event": "SessionStart",
+      "command": "WYRD_DIFF_AGENT=codex WYRD_DIFF_AGENT_SESSION_ID=\"$CODEX_SESSION_ID\" cargo run --manifest-path /path/to/wyrd-diff/Cargo.toml --locked -p wyrd-diff-cli -- hook agent-start",
+      "timeout": 30000
+    },
+    {
       "event": "Stop",
-      "command": "cargo run --manifest-path /path/to/wyrd-diff/Cargo.toml --locked -p wyrd-diff-cli -- hook agent-stop",
+      "command": "WYRD_DIFF_AGENT=codex WYRD_DIFF_AGENT_SESSION_ID=\"$CODEX_SESSION_ID\" cargo run --manifest-path /path/to/wyrd-diff/Cargo.toml --locked -p wyrd-diff-cli -- hook agent-stop",
       "timeout": 30000
     }
   ]

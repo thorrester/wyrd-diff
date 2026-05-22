@@ -51,7 +51,8 @@ create table if not exists files (
   status text not null,
   additions integer not null,
   deletions integer not null,
-  review_state text not null
+  review_state text not null,
+  patch_blob text
 );
 
 create table if not exists hunks (
@@ -202,3 +203,11 @@ create virtual table if not exists search_index using fts5(
   title,
   body
 );
+
+create index if not exists idx_files_session_id on files(session_id);
+create index if not exists idx_hunks_file_id on hunks(file_id);
+create index if not exists idx_diff_lines_hunk_id on diff_lines(hunk_id);
+create index if not exists idx_commits_session_id on commits(session_id);
+create index if not exists idx_comments_session_id on comments(session_id);
+create index if not exists idx_review_threads_session_id on review_threads(session_id);
+create index if not exists idx_thread_messages_thread_id on thread_messages(thread_id);

@@ -11,7 +11,7 @@ use std::{
     process::Command,
 };
 use wyrd_diff_core::{
-    Database, NewFixImport, NewRepo, NewReviewSession,
+    Database, NewAgentSession, NewFixImport, NewRepo, NewReviewSession,
     agent_config::{ConfigAction, DEFAULT_MCP_URL, configure_agents},
 };
 
@@ -64,11 +64,13 @@ async fn main() -> Result<()> {
                     .next()
                     .unwrap_or_else(|| format!("{base_ref}..{head_ref}"));
                 db.migrate()?;
+                let branch = args.next();
                 let session = db.create_review_session(NewReviewSession {
                     repo_id,
                     title,
                     base_ref,
                     head_ref,
+                    branch,
                 })?;
                 println!("{}", serde_json::to_string_pretty(&session)?);
                 Ok(())
@@ -105,11 +107,15 @@ async fn main() -> Result<()> {
             _ => bail!("usage: wyrd-diff-cli review <create|context|record-fix>"),
         },
         "hook" => match args.next().as_deref() {
+            Some("agent-start") => {
+                db.migrate()?;
+                record_agent_start(&db)
+            }
             Some("agent-stop") => {
                 db.migrate()?;
                 record_agent_stop(&db)
             }
-            _ => bail!("usage: wyrd-diff-cli hook agent-stop"),
+            _ => bail!("usage: wyrd-diff-cli hook <agent-start|agent-stop>"),
         },
         "export" => match args.next().as_deref() {
             Some("trajectory") => {
@@ -195,17 +201,64 @@ fn read_optional_text(input: Option<String>) -> Result<Option<String>> {
     }
 }
 
-fn record_agent_stop(db: &Database) -> Result<()> {
-    let Ok(session_id) = env::var("WYRD_DIFF_SESSION_ID") else {
+fn record_agent_start(db: &Database) -> Result<()> {
+    let Ok(agent_session_id) = env::var("WYRD_DIFF_AGENT_SESSION_ID") else {
         drain_stdin()?;
-        println!("wyrd-diff hook skipped: WYRD_DIFF_SESSION_ID is not set");
+        println!("wyrd-diff hook skipped: WYRD_DIFF_AGENT_SESSION_ID is not set");
         return Ok(());
     };
-    if session_id.trim().is_empty() {
+    if agent_session_id.trim().is_empty() {
         drain_stdin()?;
-        println!("wyrd-diff hook skipped: WYRD_DIFF_SESSION_ID is empty");
+        println!("wyrd-diff hook skipped: WYRD_DIFF_AGENT_SESSION_ID is empty");
         return Ok(());
     }
+    let agent_name = env::var("WYRD_DIFF_AGENT").unwrap_or_else(|_| "agent".to_string());
+    let repo_path = env::var("WYRD_DIFF_REPO_PATH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(current_repo_root);
+    let branch = env::var("WYRD_DIFF_BRANCH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(current_branch);
+    drain_stdin()?;
+    let record = db.register_agent_session(NewAgentSession {
+        agent_session_id,
+        agent_name,
+        repo_path,
+        branch,
+    })?;
+    let linked = record
+        .review_session_id
+        .as_deref()
+        .unwrap_or("(no active review for branch)");
+    println!(
+        "wyrd-diff hook registered agent session {} ({}); linked review: {linked}",
+        record.id, record.agent_name
+    );
+    Ok(())
+}
+
+fn record_agent_stop(db: &Database) -> Result<()> {
+    let agent_name = env::var("WYRD_DIFF_AGENT").unwrap_or_else(|_| "agent".to_string());
+    let agent_session_id = env::var("WYRD_DIFF_AGENT_SESSION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if let Some(id) = agent_session_id.as_deref() {
+        db.bump_agent_session_activity(id, &agent_name)?;
+    }
+
+    let session_id = match agent_session_id.as_deref() {
+        Some(id) => db.linked_review_session_for_agent(id, &agent_name)?,
+        None => env::var("WYRD_DIFF_SESSION_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+    };
+    let Some(session_id) = session_id else {
+        drain_stdin()?;
+        println!("wyrd-diff hook skipped: no linked review session for agent");
+        return Ok(());
+    };
 
     let commit_sha = env::var("WYRD_DIFF_COMMIT_SHA").unwrap_or_else(|_| current_head());
     if commit_sha.is_empty() {
@@ -236,12 +289,11 @@ fn record_agent_stop(db: &Database) -> Result<()> {
         .transpose()
         .context("failed to read WYRD_DIFF_TESTS_FILE")?;
     let accepted = env::var("WYRD_DIFF_ACCEPTED").map_or(true, |value| value != "false");
-    let agent_name = Some(env::var("WYRD_DIFF_AGENT").unwrap_or_else(|_| "agent".to_string()));
 
     let id = db.import_fix(NewFixImport {
         session_id,
         commit_sha,
-        agent_name,
+        agent_name: Some(agent_name),
         response_text,
         tests_json,
         accepted,
@@ -258,13 +310,24 @@ fn drain_stdin() -> Result<String> {
 }
 
 fn current_head() -> String {
-    let Ok(output) = Command::new("git").args(["rev-parse", "HEAD"]).output() else {
-        return String::new();
-    };
+    git_capture(&["rev-parse", "HEAD"]).unwrap_or_default()
+}
+
+fn current_repo_root() -> Option<String> {
+    git_capture(&["rev-parse", "--show-toplevel"])
+}
+
+fn current_branch() -> Option<String> {
+    git_capture(&["rev-parse", "--abbrev-ref", "HEAD"]).filter(|value| value != "HEAD")
+}
+
+fn git_capture(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
     if !output.status.success() {
-        return String::new();
+        return None;
     }
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 fn print_help() {
@@ -280,6 +343,7 @@ Commands:
   review create <repo_id> <base_ref> <head_ref> [title]
   review context <session_id>
   review record-fix <session_id> <commit_sha> [response_file|-] [tests_json_file]
+  hook agent-start
   hook agent-stop
   export trajectory [repo_id]
   configure-agents [mcp_url]
