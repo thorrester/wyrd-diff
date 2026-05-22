@@ -52,7 +52,45 @@ The home view tracks active reviews across repositories and branches. The review
 view keeps the file tree, highlighted diff, line selection, and thread composer
 in one workspace.
 
-## Quick start
+## Install
+
+Download the latest release from [GitHub Releases](https://github.com/thorrester/wyrd-diff/releases).
+
+### macOS
+
+Two builds are available: `aarch64` (Apple Silicon) and `x86_64` (Intel). Download the `.dmg` for your architecture, open it, and drag `Wyrd Diff.app` to Applications.
+
+**Gatekeeper will refuse to open it** because the app is unsigned. Run this once after dragging:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Wyrd\ Diff.app
+```
+
+Then open normally from Applications. This is a one-time step. Once open, it works like any other app.
+
+### Linux
+
+`.AppImage` works on most distributions without installation:
+
+```bash
+chmod +x wyrd-diff_*.AppImage
+./wyrd-diff_*.AppImage
+```
+
+`.deb` is also available for apt-based systems:
+
+```bash
+sudo dpkg -i wyrd-diff_*.deb
+wyrd-diff
+```
+
+### What runs when you open it
+
+The app spawns a local Axum bridge on `127.0.0.1:8765` (falls back to 8766..8774 if taken) and an MCP server at `http://127.0.0.1:8765/mcp`. SQLite state lives at `~/.config/wyrd-diff/wyrd-diff.db`. That directory is created on first launch.
+
+From there, the status pill in the bottom-right corner shows bridge health and detected agent harnesses. Click "Wire" to write the MCP config for Claude, Codex, OpenCode, or Gemini and restart the agent client.
+
+## Build from source
 
 Requires Rust 1.91+, Node 24, pnpm 10. `mise` installs the toolchain.
 
@@ -64,7 +102,7 @@ mise run dev
 
 `mise run dev` launches the Tauri desktop app. The app spawns the bridge itself, so no separate API process is needed.
 
-Once it's up, the status pill in the bottom-right shows bridge health and detected agent harnesses. Click "Wire" next to Claude, Codex, OpenCode, or Gemini and the MCP server config gets written to the right file (`~/.claude.json`, `~/.codex/config.toml`, etc.) with sibling entries preserved. Restart the agent client and `wyrd-diff` shows up as an available tool.
+Agent wiring works the same way as with the installed app. See [Agent wiring](#agent-wiring) below.
 
 ## The loop
 
@@ -98,8 +136,9 @@ Per-thread watermarks mean the agent never sees the same comment twice. Add a re
           │
           ▼
 ┌─────────────────────┐
-│  SQLite             │  reviews, threads, notes,
-│  .data/wyrd-diff.db │  decisions, fix trajectory
+│  SQLite                       │  reviews, threads, notes,
+│  ~/.config/wyrd-diff/         │  decisions, fix trajectory
+│  wyrd-diff.db                 │
 └─────────────────────┘
 ```
 

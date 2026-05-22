@@ -58,6 +58,7 @@
   let activeThreadId: string | null = null;
   let message = '';
   let filter = '';
+  let onlyAgentReplies = false;
   let leftWidth = 300;
   let filesHidden = false;
   let sessionBarHeight = 0;
@@ -205,8 +206,11 @@
   $: selectedLines = getSelectedRangeLines(files, selected, rangeStart, rangeEnd);
   $: selectedLineIds = new Set(selectedLines.map((line) => line.id));
   $: selectionLabel = formatRangeLabel(selectedLines);
-  $: threadsByLine = groupThreadsByLine(threads);
+  $: visibleThreads = onlyAgentReplies ? threads.filter(isThreadAwaitingHuman) : threads;
+  $: threadsByLine = groupThreadsByLine(visibleThreads);
   $: pendingThreadCount = threads.filter(isThreadPending).length;
+  $: agentReplyThreadCount = threads.filter(isThreadAwaitingHuman).length;
+  $: awaitingHumanThreads = threads.filter(isThreadAwaitingHuman);
 
   function isThreadPending(thread: ReviewThreadRecord) {
     if (thread.status !== 'open') return false;
@@ -219,6 +223,13 @@
     const index = visible.findIndex((message) => message.id === watermark);
     if (index < 0) return visible.some((message) => message.author_kind === 'human');
     return visible.slice(index + 1).some((message) => message.author_kind === 'human');
+  }
+
+  function isThreadAwaitingHuman(thread: ReviewThreadRecord) {
+    if (thread.status !== 'open') return false;
+    const visible = thread.messages.filter((message) => message.visibility !== 'private');
+    if (visible.length === 0) return false;
+    return visible[visible.length - 1].author_kind !== 'human';
   }
 
   let routeController: AbortController | null = null;
@@ -558,6 +569,58 @@
     return map;
   }
 
+  function lastAgentMessage(thread: ReviewThreadRecord) {
+    const visible = thread.messages.filter((message) => message.visibility !== 'private');
+    for (let i = visible.length - 1; i >= 0; i -= 1) {
+      if (visible[i].author_kind !== 'human') return visible[i];
+    }
+    return null;
+  }
+
+  function threadLineLabel(thread: ReviewThreadRecord) {
+    const start =
+      thread.range_start_new_line ??
+      thread.new_line ??
+      thread.range_start_old_line ??
+      thread.old_line;
+    const end = thread.range_end_new_line ?? thread.range_end_old_line ?? start;
+    if (start == null) return '';
+    if (end != null && end !== start) return `:${start}-${end}`;
+    return `:${start}`;
+  }
+
+  function jumpToThread(thread: ReviewThreadRecord) {
+    const owning = files.find((item) => item.file.path === thread.file_path);
+    if (owning) {
+      skipped.delete(owning.file.id);
+      collapsed.delete(owning.file.id);
+      if (isLargeFile(owning)) revealedLarge.add(owning.file.id);
+      files = files;
+      ensureFileLoadedById(owning.file.id);
+    }
+    activeThreadId = thread.id;
+    const attempt = (remaining: number) => {
+      requestAnimationFrame(() => {
+        const target = document.getElementById(`thread-${thread.id}`);
+        const container = document.querySelector<HTMLElement>('section.diff');
+        if (target && container) {
+          const stickyOffset =
+            container.querySelector<HTMLElement>('.session-bar')?.offsetHeight ?? 0;
+          const top =
+            target.getBoundingClientRect().top -
+            container.getBoundingClientRect().top +
+            container.scrollTop -
+            stickyOffset -
+            12;
+          container.scrollTo({ top, behavior: 'smooth' });
+          return;
+        }
+        if (remaining > 0) setTimeout(() => attempt(remaining - 1), 80);
+      });
+    };
+    attempt(20);
+  }
+
   function messageTypeLabel(type: string) {
     return type
       .split('_')
@@ -849,6 +912,20 @@
       >
         {dispatching ? 'Dispatching...' : `Dispatch batch (${pendingThreadCount})`}
       </button>
+      <button
+        class="dispatch-button"
+        class:armed={onlyAgentReplies}
+        class:alert={agentReplyThreadCount > 0}
+        disabled={agentReplyThreadCount === 0 && !onlyAgentReplies}
+        title={agentReplyThreadCount === 0
+          ? 'No threads with unread agent replies'
+          : 'Show only threads where the agent has replied and is awaiting you'}
+        on:click={() => (onlyAgentReplies = !onlyAgentReplies)}
+      >
+        {onlyAgentReplies
+          ? `Showing agent replies (${agentReplyThreadCount})`
+          : `Agent replies (${agentReplyThreadCount})`}
+      </button>
       {#if lastBatch && !batchPanelOpen}
         <button
           class="dispatch-button"
@@ -988,6 +1065,56 @@
       </header>
     {/if}
 
+    {#if onlyAgentReplies}
+      <section class="awaiting-panel" aria-label="Threads awaiting your reply">
+        <header>
+          <strong>Awaiting you</strong>
+          <span
+            >{awaitingHumanThreads.length} thread{awaitingHumanThreads.length === 1
+              ? ''
+              : 's'}</span
+          >
+          <button
+            type="button"
+            class="ghost"
+            on:click={() => (onlyAgentReplies = false)}
+            title="Show all threads">Clear filter</button
+          >
+        </header>
+        {#if awaitingHumanThreads.length === 0}
+          <p class="awaiting-empty">No agent replies awaiting your action.</p>
+        {:else}
+          <ul>
+            {#each awaitingHumanThreads as thread (thread.id)}
+              {@const last = lastAgentMessage(thread)}
+              <li>
+                <div class="awaiting-meta">
+                  <code>{thread.file_path}{threadLineLabel(thread)}</code>
+                  {#if last}
+                    <span class="awaiting-author">{last.author_name ?? last.author_kind}</span>
+                    <span class="awaiting-kind">{messageTypeLabel(last.message_type)}</span>
+                  {/if}
+                </div>
+                {#if last}
+                  <p class="awaiting-preview">{last.body}</p>
+                {/if}
+                <div class="awaiting-actions">
+                  <button type="button" on:click={() => jumpToThread(thread)}>Jump to thread</button
+                  >
+                  <button
+                    type="button"
+                    class="ghost"
+                    on:click={() => resolveThread(thread)}
+                    title="Mark thread resolved">Resolve</button
+                  >
+                </div>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </section>
+    {/if}
+
     {#each files as item (item.file.id)}
       {#if !skipped.has(item.file.id)}
         <article id={item.file.id} class:collapsed={collapsed.has(item.file.id)}>
@@ -1116,10 +1243,12 @@
                       <tr class="thread-row">
                         <td colspan="3">
                           <section
+                            id={`thread-${thread.id}`}
                             class="thread"
                             class:active={activeThreadId === thread.id}
                             class:resolved={thread.status === 'resolved'}
                             class:pending={isThreadPending(thread)}
+                            class:awaiting={isThreadAwaitingHuman(thread)}
                           >
                             <div class="thread-meta">
                               <strong>{formatRangeLabel([line])}</strong>
@@ -1485,6 +1614,18 @@
     box-shadow: var(--wm-glow-amber);
   }
 
+  .dispatch-button.alert:not(.armed) {
+    color: var(--wm-red);
+    border-color: var(--wm-red);
+    box-shadow: var(--wm-glow-red);
+  }
+
+  .dispatch-button.alert.armed {
+    color: var(--wm-red);
+    border-color: var(--wm-red);
+    box-shadow: var(--wm-glow-red);
+  }
+
   .dispatch-button:disabled {
     color: var(--wm-subtle);
     border-color: var(--wm-border);
@@ -1529,6 +1670,137 @@
     background: var(--wm-surface);
     box-shadow: var(--wm-glow-amber);
     font: 12px/1.45 var(--wm-mono);
+  }
+
+  .awaiting-panel {
+    margin: 0 0 14px;
+    padding: 12px;
+    border: 1px solid var(--wm-red);
+    background: var(--wm-surface);
+    box-shadow: var(--wm-glow-red);
+    font: 12px/1.45 var(--wm-mono);
+  }
+
+  .awaiting-panel header {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin: 0 0 10px;
+    padding: 0 0 8px;
+    border-bottom: 1px solid var(--wm-border);
+  }
+
+  .awaiting-panel header strong {
+    color: var(--wm-red);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .awaiting-panel header span {
+    color: var(--wm-muted);
+  }
+
+  .awaiting-panel header .ghost {
+    margin-left: auto;
+    padding: 4px 10px;
+    min-height: 26px;
+    background: var(--wm-bg);
+    border: 1px solid var(--wm-border-strong);
+    color: var(--wm-muted);
+    font: 700 11px/1.2 var(--wm-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    box-shadow: none;
+  }
+
+  .awaiting-panel header .ghost:hover {
+    color: var(--wm-ink);
+    border-color: var(--wm-border-strong);
+    box-shadow: none;
+    transform: none;
+  }
+
+  .awaiting-empty {
+    margin: 0;
+    color: var(--wm-muted);
+  }
+
+  .awaiting-panel ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 8px;
+  }
+
+  .awaiting-panel li {
+    padding: 10px;
+    border: 1px solid var(--wm-border-strong);
+    background: var(--wm-bg);
+    display: grid;
+    gap: 6px;
+  }
+
+  .awaiting-meta {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .awaiting-meta code {
+    color: var(--wm-ink);
+    font-weight: 700;
+  }
+
+  .awaiting-author {
+    color: var(--wm-green);
+  }
+
+  .awaiting-kind {
+    color: var(--wm-muted);
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.05em;
+  }
+
+  .awaiting-preview {
+    margin: 0;
+    color: var(--wm-ink);
+    white-space: pre-wrap;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .awaiting-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+  }
+
+  .awaiting-actions button {
+    min-height: 26px;
+    padding: 4px 10px;
+    font: 700 11px/1.2 var(--wm-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .awaiting-actions .ghost {
+    background: var(--wm-bg);
+    color: var(--wm-muted);
+    border: 1px solid var(--wm-border-strong);
+    box-shadow: none;
+  }
+
+  .awaiting-actions .ghost:hover {
+    color: var(--wm-ink);
+    border-color: var(--wm-border-strong);
+    box-shadow: none;
+    transform: none;
   }
 
   .batch-panel header {
@@ -2164,6 +2436,26 @@
   .thread.pending {
     border-color: var(--wm-amber);
     box-shadow: 0 0 12px rgba(255, 209, 102, 0.18);
+  }
+
+  .thread.awaiting {
+    border-color: var(--wm-red);
+    box-shadow: 0 0 12px rgba(255, 90, 60, 0.22);
+  }
+
+  .thread.active {
+    animation: thread-flash 1.4s ease-out;
+  }
+
+  @keyframes thread-flash {
+    0% {
+      box-shadow:
+        0 0 0 2px var(--wm-red),
+        0 0 24px rgba(255, 90, 60, 0.55);
+    }
+    100% {
+      box-shadow: 0 0 12px rgba(255, 90, 60, 0.22);
+    }
   }
 
   .badge {

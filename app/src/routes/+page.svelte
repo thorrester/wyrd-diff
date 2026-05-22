@@ -478,6 +478,10 @@
                       <strong>{entry.pending_thread_count}</strong>
                       <small>pending</small>
                     </span>
+                    <span class="stat" class:alert={entry.agent_reply_thread_count > 0}>
+                      <strong>{entry.agent_reply_thread_count}</strong>
+                      <small>awaiting you</small>
+                    </span>
                     <span class="stat">
                       <strong>{entry.open_thread_count}</strong>
                       <small>open</small>
@@ -902,6 +906,11 @@
   .stat.warn strong {
     color: var(--wm-amber);
     text-shadow: 0 0 8px rgba(255, 191, 0, 0.4);
+  }
+
+  .stat.alert strong {
+    color: var(--wm-red);
+    text-shadow: 0 0 8px rgba(255, 90, 60, 0.45);
   }
 
   .stat.live strong {

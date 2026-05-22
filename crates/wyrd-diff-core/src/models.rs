@@ -96,6 +96,10 @@ pub struct OverviewEntry {
     pub open_thread_count: i64,
     /// Threads with new reviewer input awaiting agent pull.
     pub pending_thread_count: i64,
+    /// Open threads whose latest visible message is from an agent and is
+    /// therefore awaiting reviewer action. Heuristic — no human read
+    /// watermark exists yet.
+    pub agent_reply_thread_count: i64,
     /// Agent sessions seen on this branch within the idle window.
     pub agent_sessions: Vec<AgentSessionRecord>,
     /// Last activation timestamp.
