@@ -60,6 +60,7 @@
   let filter = '';
   let leftWidth = 300;
   let filesHidden = false;
+  let sessionBarHeight = 0;
   const collapsed = new Set<string>();
   const skipped = new Set<string>();
   const revealedLarge = new Set<string>();
@@ -822,8 +823,8 @@
   <button class="resizer left-resizer" aria-label="Resize file sidebar" on:mousedown={startResize}
   ></button>
 
-  <section class="diff">
-    <div class="session-bar">
+  <section class="diff" style="--session-bar-h: {sessionBarHeight}px">
+    <div class="session-bar" bind:clientHeight={sessionBarHeight}>
       <strong>Session ID</strong>
       <code>{sessionId}</code>
       <div class="session-bar-spacer"></div>
@@ -1755,11 +1756,15 @@
   }
 
   h2 {
+    position: sticky;
+    top: var(--session-bar-h, 45px);
+    z-index: 20;
     display: flex;
     justify-content: space-between;
     gap: 12px;
     padding: 8px 10px;
     border-bottom: 1px solid var(--wm-border);
+    background: var(--wm-surface);
     font-size: 13px;
     line-height: 1.3;
   }
@@ -2371,13 +2376,6 @@
 
     .session-bar {
       margin: 0 -10px 10px;
-    }
-
-    h2 {
-      position: sticky;
-      top: 44px;
-      background: var(--wm-surface);
-      z-index: 1;
     }
 
     .inline-composer {
