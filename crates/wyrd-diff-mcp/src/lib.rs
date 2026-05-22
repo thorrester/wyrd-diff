@@ -7,7 +7,9 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::{env, path::PathBuf, process::Command};
-use wyrd_diff_core::{Database, NewAgentSession, NewFixImport, NewRepo, NewReviewSession};
+use wyrd_diff_core::{
+    Database, NewAgentSession, NewFixImport, NewRepo, NewReviewSession, NewThreadMessage,
+};
 
 /// Dispatch a single JSON-RPC request. Returns `None` for notifications.
 pub fn dispatch(db: &Database, request: Value) -> Option<Value> {
@@ -60,6 +62,9 @@ fn call_tool(db: &Database, params: Value) -> std::result::Result<Value, String>
         "wyrd_diff.register_agent_session" => register_agent_session(db, args),
         "wyrd_diff.pending_feedback" => pending_feedback(db, args),
         "wyrd_diff.import_fix" => import_fix(db, args),
+        "wyrd_diff.reply_to_thread" => reply_to_thread(db, args),
+        "wyrd_diff.resolve_thread" => resolve_thread(db, args),
+        "wyrd_diff.reopen_thread" => reopen_thread(db, args),
         "wyrd_diff.export_trajectory" => export_trajectory(db, args),
         _ => return Err(format!("unknown tool: {name}")),
     }
@@ -247,6 +252,54 @@ fn import_fix(db: &Database, args: Value) -> Result<Value> {
     Ok(json!({ "fix_import_id": id, "resolved_thread_ids": resolved }))
 }
 
+fn reply_to_thread(db: &Database, args: Value) -> Result<Value> {
+    let thread_id = required_str(&args, "thread_id")?.to_string();
+    let body = required_str(&args, "body")?.to_string();
+    let author_kind = args
+        .get("author_kind")
+        .and_then(Value::as_str)
+        .unwrap_or("agent")
+        .to_string();
+    let author_name = args
+        .get("author_name")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let message_type = args
+        .get("message_type")
+        .and_then(Value::as_str)
+        .unwrap_or("agent_response")
+        .to_string();
+    let status = args
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let visibility = args
+        .get("visibility")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let message = db.add_thread_message(NewThreadMessage {
+        thread_id,
+        author_kind: Some(author_kind),
+        author_name,
+        message_type,
+        body,
+        status,
+        visibility,
+        fix_import_id: None,
+    })?;
+    Ok(json!({ "message": message }))
+}
+
+fn resolve_thread(db: &Database, args: Value) -> Result<Value> {
+    let thread_id = required_str(&args, "thread_id")?;
+    Ok(json!({ "updated": db.resolve_thread(thread_id)?, "status": "resolved" }))
+}
+
+fn reopen_thread(db: &Database, args: Value) -> Result<Value> {
+    let thread_id = required_str(&args, "thread_id")?;
+    Ok(json!({ "updated": db.reopen_thread(thread_id)?, "status": "open" }))
+}
+
 fn resolve_session_id(db: &Database, args: &Value) -> Result<String> {
     if let Some(session_id) = args.get("session_id").and_then(Value::as_str) {
         return Ok(session_id.to_string());
@@ -392,6 +445,41 @@ fn tools() -> Value {
                         "items": { "type": "string" }
                     }
                 }
+            })
+        ),
+        tool(
+            "wyrd_diff.reply_to_thread",
+            "Post a textual reply on a review thread without requiring a commit. Use this to ask clarifying questions, explain a plan, or acknowledge feedback. Use wyrd_diff.import_fix instead once a commit lands.",
+            json!({
+                "type": "object",
+                "required": ["thread_id", "body"],
+                "properties": {
+                    "thread_id": { "type": "string" },
+                    "body": { "type": "string" },
+                    "author_kind": { "type": "string", "description": "Defaults to 'agent'." },
+                    "author_name": { "type": "string" },
+                    "message_type": { "type": "string", "description": "Defaults to 'agent_response'. Use 'question' or 'comment' for non-fix replies." },
+                    "status": { "type": "string" },
+                    "visibility": { "type": "string" }
+                }
+            })
+        ),
+        tool(
+            "wyrd_diff.resolve_thread",
+            "Mark a review thread resolved without requiring a commit.",
+            json!({
+                "type": "object",
+                "required": ["thread_id"],
+                "properties": { "thread_id": { "type": "string" } }
+            })
+        ),
+        tool(
+            "wyrd_diff.reopen_thread",
+            "Reopen a previously resolved review thread.",
+            json!({
+                "type": "object",
+                "required": ["thread_id"],
+                "properties": { "thread_id": { "type": "string" } }
             })
         ),
         tool(
