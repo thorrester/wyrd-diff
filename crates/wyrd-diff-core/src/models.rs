@@ -212,43 +212,6 @@ pub struct SourceContext {
     pub content: Option<String>,
 }
 
-/// Line-level review comment.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommentRecord {
-    /// Stable database id.
-    pub id: String,
-    /// Review session id.
-    pub session_id: String,
-    /// File path.
-    pub file_path: String,
-    /// Optional diff line id.
-    pub diff_line_id: Option<String>,
-    /// Old-side line number.
-    pub old_line: Option<i64>,
-    /// New-side line number.
-    pub new_line: Option<i64>,
-    /// Old-side start line for a selected range.
-    pub range_start_old_line: Option<i64>,
-    /// New-side start line for a selected range.
-    pub range_start_new_line: Option<i64>,
-    /// Old-side end line for a selected range.
-    pub range_end_old_line: Option<i64>,
-    /// New-side end line for a selected range.
-    pub range_end_new_line: Option<i64>,
-    /// Selected diff text for range comments.
-    pub selected_text: Option<String>,
-    /// Comment body.
-    pub body: String,
-    /// Comment status.
-    pub status: String,
-    /// Visibility policy.
-    pub visibility: String,
-    /// Creation timestamp.
-    pub created_at: String,
-    /// Last update timestamp.
-    pub updated_at: String,
-}
-
 /// Inline review thread anchored to a diff line or range.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewThreadRecord {

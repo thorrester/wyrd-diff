@@ -22,6 +22,7 @@ use tracing::{debug, info_span};
 use uuid::Uuid;
 
 const INIT_SQL: &str = include_str!("../../../migrations/001_init.sql");
+const DROP_COMMENTS_SQL: &str = include_str!("../../../migrations/002_drop_comments.sql");
 
 /// Pooled SQLite connection alias.
 pub type PooledConn = PooledConnection<SqliteConnectionManager>;
@@ -76,43 +77,6 @@ pub struct NewAgentSession {
     /// Current git branch at registration time. Optional for detached HEAD.
     #[serde(default)]
     pub branch: Option<String>,
-}
-
-/// Line-comment creation payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NewComment {
-    /// Review session id.
-    #[serde(default)]
-    pub session_id: String,
-    /// File path.
-    pub file_path: String,
-    /// Diff line id.
-    pub diff_line_id: Option<String>,
-    /// Old-side line number.
-    pub old_line: Option<i64>,
-    /// New-side line number.
-    pub new_line: Option<i64>,
-    /// Old-side start line for a selected range.
-    #[serde(default)]
-    pub range_start_old_line: Option<i64>,
-    /// New-side start line for a selected range.
-    #[serde(default)]
-    pub range_start_new_line: Option<i64>,
-    /// Old-side end line for a selected range.
-    #[serde(default)]
-    pub range_end_old_line: Option<i64>,
-    /// New-side end line for a selected range.
-    #[serde(default)]
-    pub range_end_new_line: Option<i64>,
-    /// Selected diff text for a range comment.
-    #[serde(default)]
-    pub selected_text: Option<String>,
-    /// Body.
-    pub body: String,
-    /// Status.
-    pub status: Option<String>,
-    /// Visibility.
-    pub visibility: Option<String>,
 }
 
 /// Inline thread creation payload.
@@ -316,6 +280,11 @@ impl Database {
         tx.execute_batch(INIT_SQL)?;
         tx.execute(
             "insert or ignore into schema_migrations(version, applied_at) values(1, ?1)",
+            [now()],
+        )?;
+        tx.execute_batch(DROP_COMMENTS_SQL)?;
+        tx.execute(
+            "insert or ignore into schema_migrations(version, applied_at) values(2, ?1)",
             [now()],
         )?;
         tx.commit()?;
@@ -554,10 +523,6 @@ impl Database {
         let tx = conn.transaction()?;
         let timestamp = now();
 
-        tx.execute(
-            "update comments set diff_line_id = null where session_id = ?1",
-            params![session_id],
-        )?;
         tx.execute(
             "update review_threads set anchor_diff_line_id = null where session_id = ?1",
             params![session_id],
@@ -1362,40 +1327,6 @@ impl Database {
         Ok(out)
     }
 
-    /// Add a review comment.
-    ///
-    /// # Errors
-    /// Returns an error when SQLite fails.
-    pub fn add_comment(&self, input: NewComment) -> Result<String> {
-        let conn = self.connect()?;
-        let id = new_id();
-        let timestamp = now();
-        let status = input.status.unwrap_or_else(|| "open".to_string());
-        let visibility = input.visibility.unwrap_or_else(|| "agent".to_string());
-        conn.execute(
-            "insert into comments(id, session_id, file_path, diff_line_id, old_line, new_line, range_start_old_line, range_start_new_line, range_end_old_line, range_end_new_line, selected_text, body, status, visibility, created_at, updated_at)
-             values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
-            params![
-                id,
-                input.session_id,
-                input.file_path,
-                Option::<String>::None,
-                input.old_line,
-                input.new_line,
-                input.range_start_old_line,
-                input.range_start_new_line,
-                input.range_end_old_line,
-                input.range_end_new_line,
-                input.selected_text,
-                input.body,
-                status,
-                visibility,
-                timestamp
-            ],
-        )?;
-        Ok(id)
-    }
-
     /// Add an inline review thread and its first message.
     ///
     /// # Errors
@@ -1961,11 +1892,6 @@ fn ensure_source_context_columns(conn: &Connection) -> Result<()> {
     }
     ensure_column(conn, "fix_imports", "agent_name", "text")?;
     ensure_column(conn, "fix_imports", "response_text", "text")?;
-    ensure_column(conn, "comments", "range_start_old_line", "integer")?;
-    ensure_column(conn, "comments", "range_start_new_line", "integer")?;
-    ensure_column(conn, "comments", "range_end_old_line", "integer")?;
-    ensure_column(conn, "comments", "range_end_new_line", "integer")?;
-    ensure_column(conn, "comments", "selected_text", "text")?;
     conn.execute(
         "create table if not exists active_review_sessions (
           repo_id text primary key references repos(id),
@@ -2527,8 +2453,8 @@ fn short_sha(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        Database, NewAgentSession, NewComment, NewDecision, NewFixImport, NewNote, NewRepo,
-        NewReviewSession, NewReviewThread, SourceContext,
+        Database, NewAgentSession, NewDecision, NewFixImport, NewNote, NewRepo, NewReviewSession,
+        NewReviewThread, SourceContext,
     };
     use anyhow::Result;
     use std::process::Command;
@@ -2564,21 +2490,6 @@ mod tests {
             base_ref: "master".to_string(),
             head_ref: "feature".to_string(),
             branch: Some("feature".to_string()),
-        })?;
-        db.add_comment(NewComment {
-            session_id: session.id.clone(),
-            file_path: "a.txt".to_string(),
-            diff_line_id: None,
-            old_line: None,
-            new_line: Some(2),
-            range_start_old_line: None,
-            range_start_new_line: Some(2),
-            range_end_old_line: None,
-            range_end_new_line: Some(2),
-            selected_text: Some("+two".to_string()),
-            body: "explain this addition".to_string(),
-            status: None,
-            visibility: None,
         })?;
         db.add_note(NewNote {
             repo_id: Some(repo.id),
@@ -2637,7 +2548,6 @@ mod tests {
             thread_id: Some(thread.id.clone()),
         })?;
         let context = db.agent_context(&session.id)?;
-        assert_eq!(context.open_comments.len(), 1);
         assert_eq!(context.open_threads.len(), 1);
         assert_eq!(context.open_threads[0].messages.len(), 2);
         assert_eq!(context.open_threads[0].messages[1].author_kind, "agent");
@@ -2834,32 +2744,6 @@ mod tests {
             branch: Some("feature".to_string()),
         })?;
         Ok((db, session.id))
-    }
-
-    #[test]
-    fn add_comment_with_synthetic_diff_line_id_persists_with_null_anchor() -> Result<()> {
-        let temp = tempdir()?;
-        let (db, session_id) = fixture_session(temp.path())?;
-        let id = db.add_comment(NewComment {
-            session_id: session_id.clone(),
-            file_path: "a.txt".to_string(),
-            diff_line_id: Some("a.txt#h0#l0".to_string()),
-            old_line: None,
-            new_line: Some(2),
-            range_start_old_line: None,
-            range_start_new_line: Some(2),
-            range_end_old_line: None,
-            range_end_new_line: Some(2),
-            selected_text: Some("+two".to_string()),
-            body: "needs a check".to_string(),
-            status: None,
-            visibility: None,
-        })?;
-        assert!(!id.is_empty());
-        let ctx = db.agent_context(&session_id)?;
-        assert_eq!(ctx.open_comments.len(), 1);
-        assert!(ctx.open_comments[0].diff_line_id.is_none());
-        Ok(())
     }
 
     #[test]

@@ -59,12 +59,13 @@
   let message = '';
   let filter = '';
   let onlyAgentReplies = false;
+  let pendingDeleteThreadId: string | null = null;
   let leftWidth = 300;
   let filesHidden = false;
   let sessionBarHeight = 0;
-  const collapsed = new Set<string>();
-  const skipped = new Set<string>();
-  const revealedLarge = new Set<string>();
+  let collapsed = new Set<string>();
+  let skipped = new Set<string>();
+  let revealedLarge = new Set<string>();
   const largeChangeThreshold = 500;
   let lastBatch: FeedbackBatch | null = null;
   let dispatching = false;
@@ -206,8 +207,7 @@
   $: selectedLines = getSelectedRangeLines(files, selected, rangeStart, rangeEnd);
   $: selectedLineIds = new Set(selectedLines.map((line) => line.id));
   $: selectionLabel = formatRangeLabel(selectedLines);
-  $: visibleThreads = onlyAgentReplies ? threads.filter(isThreadAwaitingHuman) : threads;
-  $: threadsByLine = groupThreadsByLine(visibleThreads);
+  $: threadsByLine = groupThreadsByLine(threads);
   $: pendingThreadCount = threads.filter(isThreadPending).length;
   $: agentReplyThreadCount = threads.filter(isThreadAwaitingHuman).length;
   $: awaitingHumanThreads = threads.filter(isThreadAwaitingHuman);
@@ -592,9 +592,18 @@
   function jumpToThread(thread: ReviewThreadRecord) {
     const owning = files.find((item) => item.file.path === thread.file_path);
     if (owning) {
-      skipped.delete(owning.file.id);
-      collapsed.delete(owning.file.id);
-      if (isLargeFile(owning)) revealedLarge.add(owning.file.id);
+      if (skipped.has(owning.file.id)) {
+        skipped.delete(owning.file.id);
+        skipped = new Set(skipped);
+      }
+      if (collapsed.has(owning.file.id)) {
+        collapsed.delete(owning.file.id);
+        collapsed = new Set(collapsed);
+      }
+      if (isLargeFile(owning) && !revealedLarge.has(owning.file.id)) {
+        revealedLarge.add(owning.file.id);
+        revealedLarge = new Set(revealedLarge);
+      }
       files = files;
       ensureFileLoadedById(owning.file.id);
     }
@@ -664,10 +673,18 @@
   }
 
   async function deleteThread(thread: ReviewThreadRecord) {
-    if (!confirm('Delete this thread and all its messages?')) return;
     await api(`/api/review-threads/${thread.id}`, { method: 'DELETE' });
     threads = threads.filter((item) => item.id !== thread.id);
     if (activeThreadId === thread.id) activeThreadId = null;
+    pendingDeleteThreadId = null;
+  }
+
+  function requestDeleteThread(thread: ReviewThreadRecord) {
+    pendingDeleteThreadId = thread.id;
+  }
+
+  function cancelDeleteThread() {
+    pendingDeleteThreadId = null;
   }
 
   async function resolveThread(thread: ReviewThreadRecord) {
@@ -1273,12 +1290,29 @@
                                   on:click={() => reopenThread(thread)}>Reopen</button
                                 >
                               {/if}
-                              <button
-                                class="thread-delete"
-                                aria-label="Delete thread"
-                                title="Delete thread"
-                                on:click={() => deleteThread(thread)}>Delete</button
-                              >
+                              {#if pendingDeleteThreadId === thread.id}
+                                <button
+                                  class="thread-delete confirm"
+                                  aria-label="Confirm delete thread"
+                                  title="Confirm delete"
+                                  on:click={() => deleteThread(thread)}
+                                  >Confirm delete</button
+                                >
+                                <button
+                                  class="thread-action"
+                                  aria-label="Cancel delete"
+                                  title="Cancel"
+                                  on:click={cancelDeleteThread}>Cancel</button
+                                >
+                              {:else}
+                                <button
+                                  class="thread-delete"
+                                  aria-label="Delete thread"
+                                  title="Delete thread"
+                                  on:click={() => requestDeleteThread(thread)}
+                                  >Delete</button
+                                >
+                              {/if}
                             </div>
                             {#each thread.messages as threadMessage (threadMessage.id)}
                               <article
@@ -2410,6 +2444,12 @@
 
   .thread-delete {
     color: var(--wm-red);
+  }
+
+  .thread-delete.confirm {
+    background: var(--wm-red);
+    color: var(--wm-bg);
+    border-color: var(--wm-red);
   }
 
   .thread-meta .thread-action ~ .thread-delete {

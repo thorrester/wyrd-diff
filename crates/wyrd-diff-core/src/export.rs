@@ -1,8 +1,8 @@
 //! Agent context and trajectory exports.
 
 use crate::{
-    CommentRecord, Database, DecisionRecord, FixImportRecord, NoteRecord, RepoRecord,
-    ReviewSessionRecord, ReviewThreadRecord, SourceContext,
+    Database, DecisionRecord, FixImportRecord, NoteRecord, RepoRecord, ReviewSessionRecord,
+    ReviewThreadRecord, SourceContext,
 };
 use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
@@ -15,8 +15,6 @@ pub struct AgentContext {
     pub repo: RepoRecord,
     /// Review session.
     pub session: ReviewSessionRecord,
-    /// Open agent-visible comments.
-    pub open_comments: Vec<CommentRecord>,
     /// Open agent-visible inline threads.
     pub open_threads: Vec<ReviewThreadRecord>,
     /// Accepted agent-visible decisions.
@@ -30,8 +28,6 @@ pub struct AgentContext {
 pub struct TrajectoryRecord {
     /// Review session.
     pub session: ReviewSessionRecord,
-    /// Comment that drove the fix.
-    pub comment: Option<CommentRecord>,
     /// Accepted decisions available for the fix.
     pub decisions: Vec<DecisionRecord>,
     /// Accepted fix import.
@@ -87,11 +83,6 @@ pub fn agent_context(db: &Database, session_id: &str) -> Result<AgentContext> {
     Ok(AgentContext {
         repo,
         session,
-        open_comments: comments(
-            &conn,
-            session_id,
-            "status = 'open' and visibility = 'agent'",
-        )?,
         open_threads: db
             .review_threads(session_id)?
             .into_iter()
@@ -136,10 +127,8 @@ pub fn trajectory_records(db: &Database, repo_id: Option<&str>) -> Result<Vec<Tr
     let mut records = Vec::new();
     for fix in fixes {
         let session = session(&conn, &fix.session_id)?;
-        let mut open = comments(&conn, &fix.session_id, "visibility = 'agent'")?;
         records.push(TrajectoryRecord {
             decisions: decisions(&conn, &fix.session_id, "visibility = 'agent'")?,
-            comment: open.pop(),
             session,
             fix,
         });
@@ -169,39 +158,6 @@ fn session(conn: &rusqlite::Connection, id: &str) -> Result<ReviewSessionRecord>
         },
     )
     .map_err(Into::into)
-}
-
-fn comments(
-    conn: &rusqlite::Connection,
-    session_id: &str,
-    filter: &str,
-) -> Result<Vec<CommentRecord>> {
-    let mut stmt = conn.prepare(&format!(
-        "select id, session_id, file_path, diff_line_id, old_line, new_line, range_start_old_line, range_start_new_line, range_end_old_line, range_end_new_line, selected_text, body, status, visibility, created_at, updated_at
-         from comments where session_id = ?1 and {filter} order by created_at"
-    ))?;
-    let rows = stmt.query_map([session_id], |row| {
-        Ok(CommentRecord {
-            id: row.get(0)?,
-            session_id: row.get(1)?,
-            file_path: row.get(2)?,
-            diff_line_id: row.get(3)?,
-            old_line: row.get(4)?,
-            new_line: row.get(5)?,
-            range_start_old_line: row.get(6)?,
-            range_start_new_line: row.get(7)?,
-            range_end_old_line: row.get(8)?,
-            range_end_new_line: row.get(9)?,
-            selected_text: row.get(10)?,
-            body: row.get(11)?,
-            status: row.get(12)?,
-            visibility: row.get(13)?,
-            created_at: row.get(14)?,
-            updated_at: row.get(15)?,
-        })
-    })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
 }
 
 fn notes(conn: &rusqlite::Connection, session_id: &str, filter: &str) -> Result<Vec<NoteRecord>> {
